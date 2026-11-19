@@ -107,6 +107,32 @@ def test_ai_unavailable_never_selects_loudness_only_clips():
     assert "unavailable" in info["note"]
 
 
+def live_judged(candidate_changes=None, words=None):
+    words = transcript() if words is None else words
+    c = candidate(**(candidate_changes or {}))
+    with patch.object(brain, "ask_ai", return_value=([c], "test-model", 1)):
+        clips, _ = brain.judge_transcript(words, 0, 15, min_len=15, max_len=30)
+    return clips
+
+
+def test_live_judge_rejects_generic_hook():
+    assert live_judged({"hook": "WAIT FOR IT"}) == []
+
+
+def test_live_judge_rejects_unsupported_claim():
+    assert live_judged({"title": "A dragon wins the tournament"}) == []
+
+
+def test_live_judge_rejects_insufficient_transcript_evidence():
+    words = [{"s": i * 0.25, "e": i * 0.25 + 0.1, "w": "ah"} for i in range(64)]
+    assert live_judged(words=words) == []
+
+
+def test_live_judge_keeps_valid_candidate():
+    clips = live_judged()
+    assert len(clips) == 1 and clips[0]["start"] == 0
+
+
 if __name__ == "__main__":
     checks = [value for name, value in sorted(globals().items())
               if name.startswith("test_") and callable(value)]

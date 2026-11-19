@@ -514,6 +514,9 @@ def judge_transcript(words, start, now, title="", uploader="", min_len=15, max_l
         s, e = _snap(c, lines, words, min_len, max_len, now)
         if e - s < min_len - 1 or _overlaps(s, e, list(existing) + clips):
             continue
+        valid, _why = validate_candidate(c, s, e, lines, words, min_len, max_len)
+        if not valid:
+            continue
         clips.append(_tidy(c, s, e, game))
     return clips, spent
 

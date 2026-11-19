@@ -72,24 +72,28 @@ def _cleanup_confirmed(p: dict, job: dict, clip: dict) -> None:
     """Best-effort cleanup; a cleanup problem must never turn a confirmed upload into a failure."""
     with _lock:
         related = [x for x in _posts if x.get("user") == p.get("user") and x.get("job") == p.get("job")]
-    def youtube_confirmed_for(clip_id):
-        return any(x.get("clip") == clip_id and x.get("platform") == "youtube" and _remote_confirmed(x)
-                   for x in related)
+    def clip_posts_confirmed(clip_id):
+        posts = [x for x in related if x.get("clip") == clip_id]
+        return (bool(posts)
+                and any(x.get("platform") == "youtube" and _remote_confirmed(x) for x in posts)
+                and all(_remote_confirmed(x) for x in posts))
 
-    # A clip may be deleted only because that same clip has a confirmed
-    # YouTube post. Other platforms never grant authorization for it.
-    if youtube_confirmed_for(p.get("clip")):
+    # A clip may be deleted only after every post for that exact clip is
+    # confirmed. A pending, uploading, uncertain, or retryable post still
+    # needs the local media.
+    if clip_posts_confirmed(p.get("clip")):
         result = cleanup.clip(job, clip)
         p["cleanup_clip"] = "done" if result["ok"] else "partial"
         if result["errors"]:
             p["cleanup_error"] = "; ".join(result["errors"])[-500:]
 
     # Whole-job cleanup is allowed only when every clip is finished and every
-    # clip independently has a confirmed YouTube post. Otherwise cleanup.job()
-    # could remove files belonging to a pending or non-YouTube-only clip.
+    # clip independently has a confirmed YouTube post and all its platform
+    # posts are confirmed. Otherwise cleanup.job() could remove files
+    # belonging to a pending or non-YouTube-only clip.
     clips = list(job.get("clips", []))
     every_clip_confirmed = bool(clips) and all(
-        c.get("status") == "done" and youtube_confirmed_for(c.get("id")) for c in clips
+        c.get("status") == "done" and clip_posts_confirmed(c.get("id")) for c in clips
     )
     if every_clip_confirmed:
         result = cleanup.job(job)

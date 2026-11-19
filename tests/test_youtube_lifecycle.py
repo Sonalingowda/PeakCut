@@ -374,6 +374,49 @@ def main():
     assert not (mixed3_clips / "a.mp4").exists()
     assert (mixed3_clips / "b.mp4").exists() and (mixed3_clips / "c.mp4").exists()
 
+    # A confirmed YouTube post does not authorize deleting the same clip while
+    # another platform still needs its local media.
+    same_root = config.user_dir("user01") / "jobs" / "same-clip-mixed"
+    same_clips = same_root / "clips"
+    same_clips.mkdir(parents=True)
+    same_job = {"id": "same-clip", "user": "user01", "dir": str(same_root),
+                "clips": [{"id": "clip", "status": "done", "file": "clip.mp4"}]}
+    same_clip = same_job["clips"][0]
+    same_yt = {"id": "same-yt", "user": "user01", "job": "same-clip", "clip": "clip",
+               "platform": "youtube", "status": "posted", "remote_state": "published",
+               "processing_confirmed_at": 1, "published_at": "2099-01-01T00:00:00Z"}
+    for other in (
+        {"id": "same-ig", "platform": "instagram", "status": "scheduled", "remote_state": "local_queued"},
+        {"id": "same-tt", "platform": "tiktok", "status": "scheduled", "remote_state": "local_queued"},
+        {"id": "same-uncertain", "platform": "instagram", "status": "uncertain", "remote_state": "uncertain"},
+    ):
+        other.update(user="user01", job="same-clip", clip="clip")
+        (same_clips / "clip.mp4").write_bytes(b"keep")
+        posting._posts[:] = [same_yt, other]
+        with ctx.as_user("user01"):
+            posting._cleanup_confirmed(same_yt, same_job, same_clip)
+        assert (same_clips / "clip.mp4").exists()
+
+    # Once every associated platform post is confirmed, clip cleanup may run.
+    confirmed_other = {"id": "same-ig", "user": "user01", "job": "same-clip", "clip": "clip",
+                       "platform": "instagram", "status": "posted", "remote_state": "published"}
+    (same_clips / "clip.mp4").write_bytes(b"remove")
+    posting._posts[:] = [same_yt, confirmed_other]
+    with ctx.as_user("user01"):
+        posting._cleanup_confirmed(same_yt, same_job, same_clip)
+    assert not (same_clips / "clip.mp4").exists()
+
+    # Restart recovery must retain the clip if another platform is still pending.
+    (same_clips / "clip.mp4").write_bytes(b"restart keep")
+    pending_other = {**confirmed_other, "status": "scheduled", "remote_state": "local_queued"}
+    same_yt.update(cleanup_job="partial", cleanup_clip=None)
+    posting._posts[:] = [same_yt, pending_other]
+    with patch.object(posting.jobs, "get", return_value=same_job), patch.object(posting, "_save"), \
+         patch.object(posting, "_mirror"), patch.object(posting.threading, "Thread"):
+        with ctx.as_user("user01"):
+            posting.start()
+    assert (same_clips / "clip.mp4").exists() and same_yt.get("cleanup_clip") != "done"
+
     # Restart retries a persisted partial cleanup only for a confirmed YouTube
     # post, and leaves the metadata record in place after completion.
     (post_root / "clips" / "clip1.mp4").write_bytes(b"retry cleanup")
