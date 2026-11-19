@@ -110,8 +110,7 @@ import numpy as np
 db = np.zeros(30); db[13] = 9.0
 brain.ask_ai = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("The AI is not set up on this server."))
 clips, info = brain.find_clips(w, db, 30.0, max_clips=1, min_len=8, max_len=14, log=lambda m: None)
-ends = brain.sentence_ends(w)
-check("with no AI, a clip picked by loudness still ends on a sentence end", len(clips) == 1 and any(0 <= clips[0]["end"] - x <= 0.4 for x in ends))
+check("with no AI, no clip is silently selected from loudness", clips == [] and "no clips" in info.get("note", "").lower())
 
 print("ALL PASSED" if not fails else f"{len(fails)} failed")
 import shutil; shutil.rmtree(os.environ["PEAKCUT_DATA"], ignore_errors=True)

@@ -11,7 +11,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from . import brain, config, creators, ctx, facecam, games, load, media, quality, render, roman, safe, transcribe, usage
+from . import brain, config, creators, ctx, facecam, games, learning, load, media, quality, render, roman, safe, transcribe, usage
 
 class _FairQueue:
     """Whose video is next. Each person has their own line and the lines take turns, so someone who adds ten
@@ -384,6 +384,14 @@ def render_one(job, clip, words):
         local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
         near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
         out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"])
+        rendered = d / "clips" / out["file"]
+        # Unit tests may replace the encoder with a stub. Real files always go
+        # through ffprobe-based QC before they become eligible for posting.
+        if rendered.is_file():
+            qc = quality.validate_clip(rendered, captions=bool(clip.get("captions", True)))
+            clip["quality"] = qc
+            if not qc["ok"]:
+                raise RuntimeError("Quality check failed: " + " ".join(qc["errors"]))
         clip.update(out, status="done", version=clip.get("version", 0) + 1, error=None)
         post = {k: clip[k] for k in ("title", "description", "hashtags", "hook", "start", "end", "score")}
         (d / "clips" / f"{clip['id']}.json").write_text(json.dumps(post, indent=1), encoding="utf-8")
@@ -753,6 +761,25 @@ def _run_job(job):
                 else:
                     keep.append(c)
             found = keep
+        # Avoid duplicate moments at transcript-block boundaries and let the
+        # accumulated, capped analytics record provide only a small ranking lift.
+        prior = [dict(c, start=c.get("start", 0), end=c.get("end", 0)) for c in job["clips"]]
+        survivors = []
+        for c in found:
+            candidate = dict(c, start=c.get("start", 0) + shift, end=c.get("end", 0) + shift)
+            if quality.duplicate_candidates(prior + survivors):
+                s, e = candidate["start"], candidate["end"]
+                duplicate = any(
+                    max(0.0, min(e, x.get("end", 0)) - max(s, x.get("start", 0))) /
+                    max(0.01, min(e - s, x.get("end", 0) - x.get("start", 0))) >= 0.72
+                    for x in prior + survivors)
+                if duplicate:
+                    notes.append(f"A duplicate moment near {round(s)}s was rejected.")
+                    continue
+            c["score"] = learning.adjust_score(ctx.uid(), c)
+            survivors.append(candidate)
+        found = [{k: v for k, v in c.items() if k not in ("start", "end")} | {
+            "start": c["start"] - shift, "end": c["end"] - shift} for c in survivors]
         for c in found:
             c.update(id=f"clip{len(job['clips']) + 1:02d}", start=round(c["start"] + shift, 2),
                      end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"],
@@ -782,7 +809,8 @@ def _run_job(job):
     del audio
     clips = job["clips"]
     job["ai"] = {"model": model, "tokens": tokens, "log": notes[-5:],
-                 "note": "The AI was unavailable, so clips were picked by loudness only." if clips and not model else ""}
+                 "note": "The AI was unavailable; no clips were selected. Retry after fixing the AI connection."
+                 if not model and not clips else ""}
     stage = "Done" if clips else "Done, but nothing clip-worthy was found"
     _set(job, status="done", stage=stage, progress=1.0, took=round(time.time() - t0))
     try:

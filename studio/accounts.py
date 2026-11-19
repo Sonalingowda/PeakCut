@@ -5,6 +5,7 @@ platform's own page and come back. For that, whoever runs the server registers o
 (its id and secret), in .env or in the dashboard (Settings, Connected apps, Set up). Those belong to the server,
 never to users."""
 import base64
+import datetime as _dt
 import hashlib
 import hmac
 import json
@@ -26,13 +27,25 @@ SECRET_KEYS = ("discord_webhook", "telegram_token")
 SETTING_DEFAULTS = {"discord_webhook": "", "telegram_token": "", "telegram_chat": "", "paused": False,
                     "digest_hour": 8, "last_digest": "", "tour_done": False}
 
-YT_SCOPES = "https://www.googleapis.com/auth/youtube.upload https://www.googleapis.com/auth/youtube.readonly"
+YT_UPLOAD_SCOPE = "https://www.googleapis.com/auth/youtube.upload"
+YT_READ_SCOPE = "https://www.googleapis.com/auth/youtube.readonly"
+YT_UPDATE_SCOPE = "https://www.googleapis.com/auth/youtube.force-ssl"
+YT_SCOPES = " ".join((YT_UPLOAD_SCOPE, YT_READ_SCOPE, YT_UPDATE_SCOPE))
+YT_SCOPE_VERSION = 2
 IG = "https://graph.instagram.com"
 IG_UPLOAD = "https://rupload.facebook.com/ig-api-upload/v21.0"
 IG_SCOPES = "instagram_business_basic,instagram_business_content_publish"
 TT = "https://open.tiktokapis.com/v2"
 TT_SCOPES = "user.info.basic,video.publish"
 PLATFORM_NAMES = {"youtube": "YouTube", "instagram": "Instagram", "tiktok": "TikTok"}
+
+
+class YouTubeUploadUncertain(RuntimeError):
+    """The resumable PUT may have reached YouTube, so retrying could duplicate it."""
+
+
+class YouTubeScheduleError(RuntimeError):
+    """The video exists, but YouTube did not confirm the requested schedule."""
 
 
 def _dir() -> Path:
@@ -318,9 +331,14 @@ def _youtube_finish(code: str) -> dict:
     if not ch.get("items"):
         raise ValueError("That Google account has no YouTube channel. Create one on YouTube, then connect again.")
     item = ch["items"][0]
-    acc = {"id": f"yt_{item['id']}", "platform": "youtube", "name": item["snippet"]["title"], "added": time.time(),
+    # Google returns the granted scope set with the token response. Keep the
+    # recorded set exact: a missing scope must require reconnection rather than
+    # being mistaken for the new scheduling permission.
+    scopes = str(tok.get("scope") or "").split()
+    acc = {"id": f"yt_{item['id']}", "platform": "youtube", "channel_id": item["id"], "name": item["snippet"]["title"], "added": time.time(),
            "refresh_token": tok["refresh_token"], "access_token": tok["access_token"],
-           "expires": time.time() + tok.get("expires_in", 3600) - 60}
+           "expires": time.time() + tok.get("expires_in", 3600) - 60,
+           "oauth_scope_version": YT_SCOPE_VERSION, "oauth_scopes": scopes}
     _put(acc)
     return acc
 
@@ -338,21 +356,176 @@ def _yt_token(acc) -> str:
     return acc["access_token"]
 
 
-def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str):
+def youtube_scope_ready(acc: dict) -> bool:
+    scopes = set(acc.get("oauth_scopes") or [])
+    return acc.get("oauth_scope_version") == YT_SCOPE_VERSION and {YT_UPLOAD_SCOPE, YT_READ_SCOPE, YT_UPDATE_SCOPE}.issubset(scopes)
+
+
+def require_youtube_schedule_scope(acc: dict) -> None:
+    if not youtube_scope_ready(acc):
+        raise RuntimeError("Reconnect YouTube to grant the scheduling permission. The existing sign-in cannot update video schedules.")
+
+
+def youtube_upload(acc, path: Path, title: str, description: str, tags: list, privacy: str,
+                   session_callback=None, video_callback=None):
     token = _yt_token(acc)
     meta = {"snippet": {"title": re.sub(r"[<>]", "", title)[:100] or "Clip", "description": re.sub(r"[<>]", "", description)[:4900],
                         "tags": tags[:15], "categoryId": "20"},
             "status": {"privacyStatus": privacy, "selfDeclaredMadeForKids": False}}
     size = path.stat().st_size
-    start = _check(httpx.post("https://www.googleapis.com/upload/youtube/v3/videos",
-                              params={"uploadType": "resumable", "part": "snippet,status"}, json=meta,
-                              headers={"Authorization": f"Bearer {token}", "X-Upload-Content-Type": "video/mp4",
-                                       "X-Upload-Content-Length": str(size)}, timeout=60), "Starting the YouTube upload")
-    with path.open("rb") as f:
-        done = _check(httpx.put(start.headers["Location"], content=f.read(),
-                                headers={"Authorization": f"Bearer {token}", "Content-Type": "video/mp4"}, timeout=900),
-                      "Uploading to YouTube").json()
-    return done["id"], f"https://www.youtube.com/shorts/{done['id']}"
+    try:
+        start = _check(httpx.post("https://www.googleapis.com/upload/youtube/v3/videos",
+                                  params={"uploadType": "resumable", "part": "snippet,status"}, json=meta,
+                                  headers={"Authorization": f"Bearer {token}", "X-Upload-Content-Type": "video/mp4",
+                                           "X-Upload-Content-Length": str(size)}, timeout=60), "Starting the YouTube upload")
+    except Exception as e:  # The session may have been created before the client saw the failure.
+        raise YouTubeUploadUncertain("YouTube upload setup is uncertain; manual resolution is required before retrying.") from e
+    session = start.headers.get("Location")
+    if not session:
+        raise YouTubeUploadUncertain("YouTube did not return a resumable upload session.")
+    if session_callback:
+        session_callback(session)
+    try:
+        with path.open("rb") as f:
+            done = _check(httpx.put(session, content=f.read(),
+                                    headers={"Authorization": f"Bearer {token}", "Content-Type": "video/mp4"}, timeout=900),
+                          "Uploading to YouTube").json()
+    except Exception as e:  # The server may have accepted the bytes before the client failed.
+        raise YouTubeUploadUncertain("YouTube upload outcome is uncertain; the local video was retained for retry.") from e
+    video_id = str(done.get("id") or "")
+    if not video_id:
+        raise YouTubeUploadUncertain("YouTube accepted the upload request without returning a video id.")
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    if video_callback:
+        try:
+            video_callback(video_id, url)
+        except Exception as e:
+            raise YouTubeUploadUncertain("YouTube returned a video id but it could not be persisted safely.") from e
+    return video_id, url
+
+
+def youtube_resume_upload(acc, path: Path, session: str, video_callback=None):
+    """Resume/query the persisted resumable session; never starts a new videos.insert."""
+    token = _yt_token(acc)
+    size = path.stat().st_size
+    headers = {"Authorization": f"Bearer {token}", "Content-Range": f"bytes */{size}"}
+    try:
+        probe = httpx.put(session, content=b"", headers=headers, timeout=45)
+    except Exception as e:
+        raise YouTubeUploadUncertain("The saved YouTube upload session cannot be queried; manual resolution is required.") from e
+    if probe.status_code in (200, 201):
+        done = probe.json()
+    elif probe.status_code == 308:
+        end = probe.headers.get("Range", "").rsplit("-", 1)[-1:]
+        offset = int(end[0]) + 1 if end and end[0].isdigit() else 0
+        try:
+            with path.open("rb") as f:
+                f.seek(offset)
+                done = _check(httpx.put(session, content=f.read(), headers={"Authorization": f"Bearer {token}",
+                                    "Content-Range": f"bytes {offset}-{size - 1}/{size}", "Content-Type": "video/mp4"}, timeout=900),
+                              "Resuming the YouTube upload").json()
+        except Exception as e:
+            raise YouTubeUploadUncertain("The resumed YouTube upload is uncertain; manual resolution is required.") from e
+    else:
+        raise YouTubeUploadUncertain("The saved YouTube upload session expired; manual resolution is required.")
+    video_id = str(done.get("id") or "")
+    if not video_id:
+        raise YouTubeUploadUncertain("YouTube completed the session without returning a video id.")
+    url = f"https://www.youtube.com/shorts/{video_id}"
+    if video_callback:
+        try:
+            video_callback(video_id, url)
+        except Exception as e:
+            raise YouTubeUploadUncertain("YouTube returned a resumed video id but it could not be persisted safely.") from e
+    return video_id, url
+
+
+def youtube_video_status(acc, video_id: str) -> dict:
+    """Read the authoritative status of one uploaded video."""
+    data = _check(httpx.get("https://www.googleapis.com/youtube/v3/videos",
+                             params={"part": "status,snippet", "id": video_id},
+                             headers={"Authorization": f"Bearer {_yt_token(acc)}"}, timeout=30),
+                  "Confirming the YouTube upload").json()
+    items = data.get("items") or []
+    if not items or items[0].get("id") != video_id:
+        raise YouTubeScheduleError("YouTube did not return the uploaded video for confirmation.")
+    return items[0]
+
+
+def _youtube_iso(value: float, future: bool = True) -> str:
+    when = float(value)
+    if future and when <= time.time() + 5:
+        raise ValueError("A YouTube publication time must be in the future.")
+    return _dt.datetime.fromtimestamp(when, _dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def youtube_timestamp(value: float) -> str:
+    return _youtube_iso(value)
+
+
+def normalize_youtube_timestamp(value: str) -> str:
+    text = str(value or "").strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    parsed = _dt.datetime.fromisoformat(text)
+    if parsed.tzinfo is None:
+        raise ValueError("YouTube returned a timestamp without a timezone.")
+    return parsed.astimezone(_dt.timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _same_youtube_instant(left: str, right: str) -> bool:
+    try:
+        return normalize_youtube_timestamp(left) == normalize_youtube_timestamp(right)
+    except (TypeError, ValueError):
+        return False
+
+
+def youtube_confirm_upload(acc, video_id: str, expected_privacy: str) -> dict:
+    item = youtube_video_status(acc, video_id)
+    status = item.get("status") or {}
+    if status.get("uploadStatus") != "processed":
+        raise YouTubeScheduleError("YouTube has not finished processing the uploaded video.")
+    if status.get("privacyStatus") != expected_privacy:
+        raise YouTubeScheduleError("YouTube confirmed a different privacy status than requested.")
+    return item
+
+
+def youtube_schedule(acc, video_id: str, publish_at: float) -> dict:
+    """Schedule an already-uploaded, never-published private video via videos.update."""
+    require_youtube_schedule_scope(acc)
+    # Permit a restart to reconcile an already-accepted schedule whose time has
+    # passed; a new remote update still requires a future instant below.
+    requested = _youtube_iso(publish_at, future=False)
+    before = youtube_video_status(acc, video_id)
+    status = before.get("status") or {}
+    if status.get("uploadStatus") != "processed":
+        raise YouTubeScheduleError("YouTube has not finished processing the uploaded video.")
+    if status.get("privacyStatus") != "private":
+        raise YouTubeScheduleError("A scheduled Short must be private before publishAt is set.")
+    snippet = before.get("snippet") or {}
+    if snippet.get("publishedAt"):
+        raise YouTubeScheduleError("This video has already been published and cannot be scheduled again.")
+    existing = status.get("publishAt")
+    if existing:
+        if _same_youtube_instant(existing, requested):
+            return {"id": video_id, "publishAt": normalize_youtube_timestamp(existing), "privacyStatus": "private", "processing_confirmed": True, "reconciled": True}
+        raise YouTubeScheduleError("YouTube already has a different publication schedule; it was not overwritten.")
+    if float(publish_at) <= time.time() + 5:
+        raise YouTubeScheduleError("A new YouTube publication time must be in the future.")
+    try:
+        response = _check(httpx.put("https://www.googleapis.com/youtube/v3/videos",
+                                    params={"part": "status"},
+                                    json={"id": video_id, "status": {"privacyStatus": "private", "publishAt": requested}},
+                                    headers={"Authorization": f"Bearer {_yt_token(acc)}",
+                                             "Content-Type": "application/json"}, timeout=45),
+                          "Scheduling the YouTube video").json()
+    except Exception as e:
+        raise YouTubeScheduleError("YouTube did not accept the publication schedule.") from e
+    confirmed = response.get("status") or {}
+    returned = confirmed.get("publishAt")
+    if response.get("id") != video_id or confirmed.get("privacyStatus") != "private" or not returned or not _same_youtube_instant(returned, requested):
+        raise YouTubeScheduleError("YouTube did not confirm the requested publication schedule.")
+    return {"id": video_id, "publishAt": normalize_youtube_timestamp(returned), "privacyStatus": "private", "processing_confirmed": True}
 
 
 def youtube_views(acc, ids: list) -> dict:
@@ -363,6 +536,35 @@ def youtube_views(acc, ids: list) -> dict:
                              headers={"Authorization": f"Bearer {_yt_token(acc)}"}, timeout=30), "Reading YouTube views").json()
         for it in r.get("items", []):
             out[it["id"]] = int(it["statistics"].get("viewCount", 0))
+    return out
+
+
+def youtube_metrics(acc, ids: list, start_date: str | None = None) -> dict:
+    """Fetch official per-video Analytics metrics when the Analytics API is enabled.
+
+    The Data API remains the fallback for view counts. Analytics is delayed and may
+    return no row for a new video, so callers must treat an empty result as normal.
+    """
+    if not ids:
+        return {}
+    start_date = start_date or time.strftime("%Y-%m-%d", time.localtime(time.time() - 90 * 86400))
+    out = {}
+    metrics = "views,engagedViews,averageViewDuration,averageViewPercentage,likes,comments,shares,subscribersGained"
+    for i in range(0, len(ids), 50):
+        params = {"ids": "channel==MINE", "startDate": start_date,
+                  "endDate": time.strftime("%Y-%m-%d"), "metrics": metrics,
+                  "dimensions": "video", "filters": "video==" + ",".join(ids[i:i + 50])}
+        r = _check(httpx.get("https://youtubeanalytics.googleapis.com/v2/reports", params=params,
+                             headers={"Authorization": f"Bearer {_yt_token(acc)}"}, timeout=45),
+                   "Reading YouTube Analytics").json()
+        headers = [h.get("name") for h in r.get("columnHeaders", [])]
+        for row in r.get("rows", []):
+            if not row:
+                continue
+            vals = dict(zip(headers, row))
+            vid = vals.pop("video", None)
+            if vid:
+                out[vid] = {k: float(v) if "." in str(v) else int(v) for k, v in vals.items()}
     return out
 
 

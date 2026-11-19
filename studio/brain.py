@@ -10,6 +10,7 @@ import numpy as np
 from . import ai, config, games, usage, roman
 
 WINDOW_SEC, OVERLAP_SEC = 15 * 60, 60
+CONTEXT_PAD_SEC = 30
 
 SCHEMA = {
     "type": "ARRAY",
@@ -32,9 +33,8 @@ SCHEMA = {
 }
 
 HEAD = """You are a clip scout for short-form gaming and streaming videos (YouTube Shorts, Reels, TikTok).
-Below is a timestamped transcript of part of a video. Each line starts with [seconds]. Lines marked (LOUD)
-are where the audio got much louder than usual: shouting, laughing, sudden action. Lines marked (CHAT)
-are where the live chat suddenly got much busier, which usually means viewers reacted to something.
+Below is a timestamped transcript of part of a video. Each line starts with [seconds]. Loudness and chat
+markers are weak clues only: they cannot establish that a moment is funny, surprising, clear, or worth clipping.
 
 Video title: {title}
 Channel: {uploader}
@@ -54,6 +54,11 @@ Rules:
 - Each clip is {min_len} to {max_len} seconds. Use the [seconds] values for start and end.
 - Start on the setup line, not mid-sentence. End right after the payoff or reaction, on the last word of a
   complete sentence: never in the middle of a sentence or a thought. The clip must make sense on its own.
+- The proposed start and end must include the needed setup, development/reaction, and payoff. Reject a moment
+  if its payoff is outside the transcript or if it depends on unexplained earlier context.
+- Hooks and titles must describe evidence in the selected transcript. Do not use empty hooks such as "BRO" or
+  "WAIT FOR IT" unless the actual spoken context makes that phrase meaningful. Never claim a visual event from
+  transcript evidence alone; describe it only when the transcript explicitly supports it.
 - Do not pick intros, sponsor reads, "like and subscribe", or dead air.
 - Skip weak moments. Fewer strong clips beat many weak ones. Return [] if nothing is worth clipping.
 - score: 0-100, how likely a stranger keeps watching. Be honest; most clips are 50-80.
@@ -114,7 +119,9 @@ def _num(v, default=0.0):
 
 
 def _fmt(lines):
-    return "\n".join(f"[{l['s']:.1f}] {'(LOUD) ' if l['loud'] else ''}{'(CHAT) ' if l.get('chat') else ''}{_safe(l['text'], 2000)}"
+    # Keep speech primary. Chat activity may be a weak clue; loudness is deliberately
+    # omitted so a shout cannot be mistaken for evidence that a moment is entertaining.
+    return "\n".join(f"[{l['s']:.1f}] {'(CHAT; weak clue) ' if l.get('chat') else ''}{_safe(l['text'], 2000)}"
                      for l in lines)
 
 
@@ -138,6 +145,51 @@ def _tidy(c, s, e, game=None):
         "highlight_words": [roman.to_roman(_text(h, 30)) for h in words][:8],
         "reason": _text(c.get("reason"), 200),
     }
+
+
+_GENERIC_HOOK_RE = re.compile(r"(?i)\b(?:bro|wait\s+for\s+it|wait|no\s+way|what|omg|insane)\b")
+_VISUAL_CLAIM_RE = re.compile(r"(?i)\b(?:he|she|they|the streamer)\s+(?:looks?|smiles?|laughs?|cries?|falls?|wins?|dies?|gets? shot|gets? killed)\b")
+
+
+def _meaningful_terms(text):
+    return {t for t in re.findall(r"[a-z0-9']+", _text(text, 200).lower()) if len(t) >= 3}
+
+
+def validate_candidate(c, start, end, lines, words, min_len, max_len):
+    """Conservative transcript evidence gate. It does not claim to verify visuals."""
+    hook = _text(c.get("hook"), 60).strip().upper()
+    title = _text(c.get("title"), 100).strip()
+    reason = _text(c.get("reason"), 200).strip()
+    if (not hook or not title or _GENERIC_HOOK_RE.search(hook)
+            or _GENERIC_HOOK_RE.search(title)):
+        return False, "missing or generic hook/title"
+    if _VISUAL_CLAIM_RE.search(hook) or _VISUAL_CLAIM_RE.search(title):
+        return False, "visual claim cannot be verified from transcript evidence"
+    if end - start > max_len + 0.5 or end - start < min_len - 1:
+        return False, "clip duration outside its allowed bounds"
+    inside = [l for l in lines if l["s"] >= start - 0.6 and l["e"] <= end + 0.6]
+    if (len(inside) < 4 or inside[-1]["e"] - inside[0]["s"] < min(8.0, end - start)
+            or inside[0]["s"] > start + 5 or inside[-1]["e"] < end - 5):
+        return False, "too little surrounding transcript context"
+    context = " ".join(l["text"] for l in inside)
+    evidence = _meaningful_terms(context)
+    hook_terms, title_terms = _meaningful_terms(hook), _meaningful_terms(title)
+    hook_matches = hook_terms & evidence
+    if len(hook_terms) < 2 or len(hook_matches) < 2 or len(hook_matches) / len(hook_terms) < 0.67:
+        return False, "hook is not meaningfully supported by the selected transcript"
+    title_matches = title_terms & evidence
+    if len(title_terms) < 2 or len(title_matches) < 2 or len(title_matches) / len(title_terms) < 0.4:
+        return False, "title is not supported by the selected transcript"
+    reason_terms = _meaningful_terms(reason)
+    if len(reason_terms) < 2 or len(reason_terms & evidence) < 2:
+        return False, "selection reason lacks transcript evidence"
+    # Require a sufficiently dense, time-spread spoken sequence. Punctuation is
+    # not treated as proof of a payoff. The language model proposes the moment's
+    # semantic arc; this gate can only check transcript support and boundaries.
+    turns = [w for w in words if start <= w["s"] <= end]
+    if len(turns) < 12 or turns[-1]["e"] - turns[0]["s"] < min(8.0, end - start):
+        return False, "spoken sequence is too sparse to establish context and development"
+    return True, "transcript supports the wording and context boundaries; payoff quality and visuals are not independently verified"
 
 
 def _same_word(old, new):
@@ -283,8 +335,10 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
         t += WINDOW_SEC - OVERLAP_SEC
     per_window = max(2, min(8, int(np.ceil(max_clips * 1.5 / len(windows))) + 1))
     extra = _game_rules(game)
-    for a, b in windows:
-        chunk = [l for l in lines if a <= l["s"] < b]
+    for wi, (a, b) in enumerate(windows):
+        # Send adjacent transcript context, but keep candidate ownership within
+        # the original window so overlap does not create duplicate selections.
+        chunk = [l for l in lines if a - CONTEXT_PAD_SEC <= l["s"] < b + CONTEXT_PAD_SEC]
         if len(chunk) < 3:
             continue
         prompt = (HEAD.format(title=_safe(title) or "unknown", uploader=_safe(uploader) or "unknown", n=per_window)
@@ -293,17 +347,27 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
         try:
             out, used_model, spent = ask_ai(prompt, purpose="Video: finding clips")
             tokens += spent
-            found += [c for c in out if isinstance(c, dict) and a - 5 <= float(c.get("start", -1)) < b]
+            # Windows overlap to provide context, but each timestamp belongs to
+            # exactly one window: the overlap is owned by the later window.
+            owner_end = min(b, windows[wi + 1][0] if wi + 1 < len(windows) else b)
+            found += [c for c in out if isinstance(c, dict) and a <= float(c.get("start", -1)) < owner_end]
         except Exception as e:  # noqa: BLE001
             log(f"AI window {a:.0f}-{b:.0f}s failed: {e}")
     note = ""
     if not used_model:
-        found = fallback_by_loudness(db, words, max_clips, max_len, duration)
-        note = "The AI was unavailable, so clips were picked by loudness only."
+        # Loudness is a useful signal for the prompt, but it cannot establish context,
+        # setup, payoff, or whether a moment is worth publishing.  Never turn an AI
+        # outage into an automatic low-quality publishing decision.
+        return [], {"model": None, "tokens": tokens,
+                    "note": "The AI was unavailable; no clips were selected. Retry after fixing the AI connection."}
     clips = []
     for c in sorted(found, key=lambda c: -_num(c.get("score"))):
         s, e = _snap(c, lines, words, min_len, max_len, duration)
         if e - s < min(min_len, duration) - 1:
+            continue
+        valid, why = validate_candidate(c, s, e, lines, words, min_len, max_len)
+        if not valid:
+            log(f"Candidate near {s:.0f}s rejected: {why}.")
             continue
         if _overlaps(s, e, clips):
             continue  # overlaps a better clip
@@ -328,6 +392,9 @@ def find_live_clips(words, z, now, chat=None, title="", uploader="", min_len=15,
     for c in sorted((c for c in out if isinstance(c, dict)), key=lambda c: -_num(c.get("score"))):
         s, e = _snap(c, lines, words, min_len, max_len, now)
         if e - s < min_len - 1 or _overlaps(s, e, list(existing) + clips):
+            continue
+        valid, _why = validate_candidate(c, s, e, lines, words, min_len, max_len)
+        if not valid:
             continue
         clips.append(_tidy(c, s, e, game))
     return clips, spent

@@ -19,7 +19,7 @@ creator's live stream and clip the highlights while the stream is still running.
 - **No sign-in on your own computer.** It opens straight into the dashboard. On a shared server, switch accounts on
   (`PEAKCUT_ACCOUNTS=1`) for email or Google sign-in and an admin dashboard.
 - **Your own AI.** Gemini, OpenAI, Grok, Groq, OpenRouter, Claude, a local model through Ollama, or anything that
-  speaks the OpenAI chat format. No key at all also works: clips are then picked by loudness.
+  speaks the OpenAI chat format. If the AI is unavailable, PeakCut stops safely instead of publishing loudness-only guesses.
 
 ## Quick start
 

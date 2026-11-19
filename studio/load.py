@@ -4,7 +4,10 @@ Nothing here counts people. New heavy work (another video, another recording) st
 room, waits in line for a moment when it is nearly full, and is let through the second it frees up again. That is
 what keeps a rush from slowing everyone down or crashing the server."""
 import os
+import re
 import shutil
+import subprocess
+import sys
 import threading
 import time
 
@@ -30,6 +33,15 @@ def _cpu_times():
         n = lambda f: (f.dwHighDateTime << 32) | f.dwLowDateTime          # noqa: E731
         total = n(kernel) + n(user)                                        # kernel time includes idle time
         return total - n(idle), total
+    if sys.platform == "darwin":
+        output = subprocess.check_output(("/usr/bin/top", "-l", "1", "-n", "0", "-F"),
+                                         text=True, stderr=subprocess.STDOUT, timeout=5)
+        values = {name: float(value) for value, name in re.findall(r"([0-9]+(?:\.[0-9]+)?)%\s+(user|sys|idle)", output)}
+        if "idle" not in values or not any(k in values for k in ("user", "sys")):
+            raise RuntimeError("macOS top returned no usable CPU sample")
+        return max(0.0, 100.0 - values["idle"]), 100.0
+    if not sys.platform.startswith("linux"):
+        raise RuntimeError(f"CPU sampling is unsupported on {sys.platform}")
     with open("/proc/stat", encoding="ascii") as f:
         v = [int(x) for x in f.readline().split()[1:9]]
     return sum(v) - v[3] - v[4], sum(v)                                    # everything except idle and waiting on disk
@@ -54,22 +66,23 @@ def _ram_free_gb() -> float:
 
 
 def _watch():
-    try:
-        last = _cpu_times()
-    except Exception:  # noqa: BLE001 - a system whose processor we cannot measure (a Mac): leave that out, keep the rest
-        last = None
+    last = None
     while True:
         time.sleep(1)
-        if last is not None:
-            try:
-                now = _cpu_times()
+        try:
+            now = _cpu_times()
+            if sys.platform == "darwin":
+                used, total = now
+                if total > 0:
+                    _state["cpu"] = 0.55 * _state["cpu"] + 0.45 * (100.0 * used / total)
+            elif last is not None:
                 used, total = now[0] - last[0], now[1] - last[1]
-                last = now
                 if total > 0:
                     # smoothed over a few seconds, so one short spike neither holds people up nor lets too much in
                     _state["cpu"] = 0.55 * _state["cpu"] + 0.45 * (100.0 * used / total)
-            except Exception:  # noqa: BLE001
-                pass
+            last = now
+        except Exception:  # noqa: BLE001 - retry the next sample; do not permanently freeze CPU at zero
+            last = None
         try:
             _state["ram_free"] = _ram_free_gb()
         except Exception:  # noqa: BLE001
