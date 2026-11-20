@@ -49,6 +49,7 @@ def main() -> int:
                 ("abuse and limits", ["tests/test_abuse.py", BASE, str(ROOT)]),
                 ("queue under load", ["tests/test_load_queue.py", str(ROOT)]),
                 ("deleting and bulk actions", ["tests/test_delete.py"]),
+                ("manual selection publishing queue", ["tests/test_posting_queue.py"]),
                 ("big uploads in pieces", ["tests/test_upload_parts.py", BASE]),
                 ("AI services", ["tests/test_ai.py"]),
                 ("no sign-in, and the AI key from the dashboard", ["tests/test_local.py"]),

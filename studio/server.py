@@ -1461,6 +1461,71 @@ def add_posts(body: dict = Body(...)):
     return {"queued": len(made)}
 
 
+@app.post("/api/posts/batch")
+def add_posts_batch(body: dict = Body(...)):
+    """Queue explicitly selected finished clips to each creator's configured accounts."""
+    raw = body.get("clips") if isinstance(body, dict) else None
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(400, "Select at least one finished clip first.")
+    if len(raw) > 300:
+        raise HTTPException(400, "Select no more than 300 clips at once.")
+    pairs, errors, seen = [], [], set()
+    for i, value in enumerate(raw, 1):
+        if (not isinstance(value, (list, tuple)) or len(value) != 2
+                or not all(isinstance(x, str) and re.fullmatch(r"[\w\-]{1,60}", x) for x in value)):
+            errors.append({"index": i, "status": "rejected", "reason": "Malformed video and clip selection."})
+            continue
+        pair = (value[0], value[1])
+        if pair not in seen:
+            seen.add(pair)
+            pairs.append(pair)
+    prepared = []
+    for jid, cid in pairs:
+        job = jobs.get(jid)
+        result = {"job": jid, "clip": cid, "status": "rejected", "reason": ""}
+        if not job:
+            result["reason"] = "That video does not belong to this account."
+        elif job.get("status") != "done":
+            result["reason"] = "The video is not finished yet."
+        else:
+            clip = next((c for c in job.get("clips", []) if c.get("id") == cid), None)
+            creator = creators.get(job.get("creator"))
+            configured = list(dict.fromkeys((creator or {}).get("accounts") or []))
+            available = [aid for aid in configured if accounts.get(aid)]
+            if not clip:
+                result["reason"] = "That clip does not exist in the selected video."
+            elif clip.get("status") != "done":
+                result["reason"] = "That clip is not finished yet."
+            elif not creator or creator.get("id") != job.get("creator"):
+                result["reason"] = "The clip's creator workspace no longer exists."
+            elif not configured:
+                result["reason"] = "The creator has no publishing accounts configured."
+            elif len(available) != len(configured):
+                result["reason"] = "One or more configured publishing accounts are disconnected."
+            else:
+                prepared.append((job, clip, available))
+                continue
+        errors.append(result)
+    if errors:
+        errors.extend({"job": job["id"], "clip": clip["id"], "status": "rejected",
+                       "reason": "The batch contains an invalid selection; nothing was queued."}
+                      for job, clip, _accounts in prepared)
+        raise HTTPException(400, detail={"message": "Nothing was queued because the selection is invalid; fix every item and try again.", "results": errors})
+
+    outcomes = posting.enqueue_batch(prepared)
+    results, totals = [], {"queued": 0, "already": 0, "needs_retry": 0, "rejected": 0}
+    for (job, clip, _accounts), outcome in zip(prepared, outcomes):
+        made, existing = outcome["made"], outcome["existing"]
+        already, needs_retry = len(existing), outcome["needs_retry"]
+        totals["queued"] += len(made)
+        totals["already"] += already
+        totals["needs_retry"] += needs_retry
+        status = "queued" if made else "needs_retry" if needs_retry else "already"
+        results.append({"job": job["id"], "clip": clip["id"], "status": status, "queued": len(made),
+                        "already": already, "needs_retry": needs_retry, "rejected": 0})
+    return {**totals, "results": results}
+
+
 @app.post("/api/posts/{pid}/{action}")
 def post_action(pid: str, action: str):
     try:

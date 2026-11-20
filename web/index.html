@@ -910,7 +910,7 @@ const opts = (map, val) => Object.entries(map).map(([k, v]) => `<option value="$
 async function api(path, opt) {
   const r = await fetch(path, opt);
   if (r.status === 401) { location.href = "/login"; throw new Error("Please sign in."); }
-  if (!r.ok) { let d = r.statusText; try { d = (await r.json()).detail || d; } catch {} throw new Error(typeof d === "string" ? d : "Something went wrong"); }
+  if (!r.ok) { let d = r.statusText; try { d = (await r.json()).detail || d; } catch {} throw new Error(typeof d === "string" ? d : d?.message || "Something went wrong"); }
   return r.json();
 }
 const send = (path, body, method = "POST") => api(path, {method, headers:{"Content-Type":"application/json"}, body:JSON.stringify(body ?? {})});
@@ -1065,7 +1065,7 @@ function aiCard() {
   const k = S.status.ai; if (!k) return "";
   return `<div class="card ai-home"><h2>AI</h2>
     <div class="ai-big">${k.ready ? esc(k.provider || "Ready") : "Not set up"}</div>
-    <p class="ai-sub">${k.ready ? esc(k.model || "") : "Clips are picked by loudness until an AI key is added."}</p>
+    <p class="ai-sub">${k.ready ? esc(k.model || "") : "Clip selection is paused until an AI key is added."}</p>
     <div class="ai-stats"><div><b>${(k.today_calls || 0).toLocaleString()}</b><span>AI calls today</span></div>
       <div><b>${fmtK(k.today_tokens)}</b><span>Tokens today</span></div></div>
     <div class="row">${!k.ready && S.status.user?.is_admin ? `<button class="btn primary" data-act="go" data-v="settings" data-tab="ai">${ic("plus")}Add AI key</button>` : ""}<button class="btn" data-act="go" data-v="usage">View usage ${ic("arrowr")}</button></div></div>`;
@@ -1295,10 +1295,10 @@ function drawShell() {  const nav = (v, icon, label, extra = "") => `<button cla
   const upBar = up && up.latest !== upSeen ? `<div class="vb" role="status">${ic("up")}<span>${up.restart ? "<b>The new version is downloaded.</b> Close PeakCut and start it again to use it." : `A new version of PeakCut is out${up.behind ? `: <b>${up.behind} update${up.behind === 1 ? "" : "s"}</b> since yours` : ""}.`}</span>
     <button class="btn sm primary" data-act="updhow">${up.restart ? "What's new" : "How to update"}</button><button class="btn sm ghost" data-act="updlater" aria-label="Hide until the next version">Later</button></div>` : "";
   const toolBar = S.status.no_ffmpeg ? `<div class="vb" role="alert">${ic("warn")}<span><b>PeakCut can't make clips yet: ffmpeg isn't installed on this computer.</b> Open a terminal, run <code>winget install Gyan.FFmpeg</code> (Mac: <code>brew install ffmpeg</code>, Linux: <code>sudo apt install ffmpeg</code>), then close PeakCut and start it again.</span></div>` : "";
-  const aiBar = !toolBar && S.status.ai?.problem && me?.is_admin && S.view !== "settings" ? `<div class="vb" role="status">${ic("warn")}<span><b>The AI isn't answering.</b> ${esc(S.status.ai.problem)} Until then, clips are picked by loudness.</span><button class="btn sm primary" data-act="go" data-v="settings" data-tab="ai">Open AI settings</button></div>` : "";
+  const aiBar = !toolBar && S.status.ai?.problem && me?.is_admin && S.view !== "settings" ? `<div class="vb" role="status">${ic("warn")}<span><b>The AI isn't answering.</b> ${esc(S.status.ai.problem)} New processing will wait until it is fixed.</span><button class="btn sm primary" data-act="go" data-v="settings" data-tab="ai">Open AI settings</button></div>` : "";
   const diskBar = !toolBar && S.status.disk_full && S.view !== "settings" ? `<div class="vb" role="alert">${ic("warn")}<span><b>The drive PeakCut saves to is almost full, so it can't take new videos.</b> Free up space on it, or move PeakCut's folder to a bigger drive.</span>${me?.is_admin ? `<button class="btn sm primary" data-act="go" data-v="settings" data-tab="storage">Open Storage</button>` : ""}</div>` : "";
   put($("#vbanner"), toolBar ? toolBar : diskBar ? diskBar : aiBar ? aiBar : upBar ? upBar : me && me.verified === false ? `<div class="vb" role="status">${ic("warn")}<span>Confirm your email to start clipping. We sent a link to <b>${esc(me.email)}</b>.</span><button class="btn sm" data-act="resendverify">Send a new link</button></div>`
-    : kk && kk.ready === false && S.view !== "usage" ? `<div class="vb" role="status">${ic("bolt")}<span>${me?.is_admin ? "Add your AI key to let the AI pick clips and write titles. Until then, clips are picked by loudness." : "The AI isn't set up on this server yet, so clips are picked by loudness."}</span>${me?.is_admin && S.view !== "settings" ? `<button class="btn sm primary" data-act="go" data-v="settings" data-tab="ai">${ic("plus")}Add AI key</button>` : ""}</div>` : "");
+    : kk && kk.ready === false && S.view !== "usage" ? `<div class="vb" role="status">${ic("bolt")}<span>${me?.is_admin ? "Add your AI key to let PeakCut identify clip-worthy moments. Processing waits until then." : "The AI isn't set up on this server yet, so processing is paused."}</span>${me?.is_admin && S.view !== "settings" ? `<button class="btn sm primary" data-act="go" data-v="settings" data-tab="ai">${ic("plus")}Add AI key</button>` : ""}</div>` : "");
   put($("#tpic"), pic); $("#tpic").classList.toggle("live", !!(c && (c.live_job || liveOn(c).length)));
   put($("#utabs"), tabs); moveInd(); $(".topbar").classList.toggle("tabbed", !!tabs);
   put($("#title"), `<span>${esc(title)}</span>`); put($("#subtitle"), subHtml ?? esc(sub)); put($("#actions"), act);
@@ -1683,7 +1683,7 @@ function clipHtml(j, c) {
     : c.status === "error" ? `<span class="making" style="animation:none;color:var(--bad);background:var(--bad-soft)">Could not make this clip. Open it to try again.</span>`
     : `<span class="making">${c.status === "rendering" ? "Making this clip…" : "Waiting its turn…"}</span>`;
   const key = `c:${j.id}:${c.id}`, busyClip = c.status === "queued" || c.status === "rendering";
-  return `<article class="clip ${sel().has(key) ? "picked" : ""}">
+  return `<article class="clip ${sel().has(key) || (sel().has("j:" + j.id) && !sel().has("x:" + j.id + ":" + c.id)) ? "picked" : ""}">
     <button class="shot" data-act="openclip" ${a} aria-label="Open clip: ${esc(c.title || c.hook)}">${body}
       <span class="badge l ${scoreCls(c.score)}" title="AI score">${c.score || "Hand"}</span><span class="badge r">${fmt(c.end - c.start)}</span></button>
     <div class="clip-body">
@@ -1691,7 +1691,7 @@ function clipHtml(j, c) {
       <div class="ttl">${esc(c.title)}</div>
       ${postPills(c) ? `<div class="row" style="gap:4px">${postPills(c)}</div>` : ""}
       <div class="clip-foot">
-        ${busyClip ? "" : `<label class="selck" title="Select this clip"><input type="checkbox" data-sel="${key}" ${sel().has(key) ? "checked" : ""} aria-label="Select this clip"></label>`}
+        ${busyClip ? "" : `<label class="selck" title="Select this clip"><input type="checkbox" data-sel="${key}" ${sel().has(key) || (sel().has("j:" + j.id) && !sel().has("x:" + j.id + ":" + c.id)) ? "checked" : ""} aria-label="Select this clip"></label>`}
         ${c.status === "done" ? `<a class="btn sm icon ghost" href="${m}${esc(c.file)}?download=1" title="Download" aria-label="Download">${ic("down")}</a>` : ""}
         <button class="btn sm icon ghost" data-act="copy" ${a} title="Copy post text" aria-label="Copy post text">${ic("copy")}</button>
         ${busyClip ? "" : `<button class="btn sm icon ghost" data-act="delclip" ${a} title="Delete this clip" aria-label="Delete this clip">${ic("trash")}</button>`}
@@ -1748,14 +1748,14 @@ function jobHtml(j) {
 /* ---- selecting several videos and clips: delete or download them together */
 const sel = () => (S.sel = S.sel || new Set());
 function selParts() {
-  const jobsSel = [], clipsSel = [];
-  for (const k of sel()) { const p = k.split(":"); if (p[0] === "j") jobsSel.push(p[1]); else clipsSel.push([p[1], p[2]]); }
-  return {jobsSel, clipsSel};
+  const jobsSel = [], clipsSel = [], excluded = [];
+  for (const k of sel()) { const p = k.split(":"); if (p[0] === "j") jobsSel.push(p[1]); else if (p[0] === "x") excluded.push([p[1], p[2]]); else clipsSel.push([p[1], p[2]]); }
+  return {jobsSel, clipsSel, excluded};
 }
 function selClips() {          // every finished clip the selection covers, for downloading
-  const {jobsSel, clipsSel} = selParts(), out = new Map();
-  jobsSel.forEach(id => (jobOf(id)?.clips || []).forEach(c => { if (c.status === "done") out.set(id + "." + c.id, 1); }));
-  clipsSel.forEach(([j, c]) => { if (jobOf(j)?.clips.find(x => x.id === c)?.status === "done") out.set(j + "." + c, 1); });
+  const {jobsSel, clipsSel, excluded} = selParts(), out = new Map(), blocked = new Set(excluded.map(([j, c]) => j + "." + c));
+  jobsSel.forEach(id => (jobOf(id)?.clips || []).forEach(c => { if (c.status === "done" && !blocked.has(id + "." + c.id)) out.set(id + "." + c.id, 1); }));
+  clipsSel.forEach(([j, c]) => { if (!blocked.has(j + "." + c) && jobOf(j)?.clips.find(x => x.id === c)?.status === "done") out.set(j + "." + c, 1); });
   return [...out.keys()];
 }
 function drawSelBar() {
@@ -1763,13 +1763,14 @@ function drawSelBar() {
   if (!bar) { bar = document.createElement("div"); bar.id = "selbar"; bar.setAttribute("role", "toolbar"); bar.setAttribute("aria-label", "Selected items"); document.body.append(bar); }
   for (const k of [...sel()]) {   // forget what is no longer there
     const p = k.split(":"), j = jobOf(p[1]);
-    if (!j || (p[0] === "c" && !j.clips.some(c => c.id === p[2]))) sel().delete(k);
+    if (!j || ((p[0] === "c" || p[0] === "x") && !j.clips.some(c => c.id === p[2]))) sel().delete(k);
   }
-  const n = sel().size, dl = selClips().length, shown = $("#jobs");
+  const dl = selClips().length, n = dl, shown = $("#jobs");
   bar.classList.toggle("on", n > 0 && !!shown);
   if (!n) return;
   put(bar, `<b>${n} selected</b>
     <button class="btn sm" data-act="selall">Select all</button>
+    <button class="btn sm primary" data-act="selqueue" ${dl ? "" : "disabled"}>${ic("send")}Queue selected${dl ? ` ${dl}` : ""}</button>
     <button class="btn sm primary" data-act="seldl" ${dl ? "" : "disabled"}>${ic("down")}Download${dl ? ` ${dl} clip${dl === 1 ? "" : "s"}` : ""}</button>
     <button class="btn sm danger" data-act="seldel">${ic("trash")}Delete</button>
     <button class="btn sm" data-act="selclear">Cancel</button>`);
@@ -1979,7 +1980,7 @@ function hbars(rows) {
 }
 function drawUsage() {
   const k = S.usage, box = $("#usage"); if (!k || !box) return;
-  box.innerHTML = `${k.ready ? "" : `<div class="note">${ic("warn")}<span>${S.status.user?.is_admin ? "No AI key is set, so clips are picked by loudness only. Add your key under Settings, AI." : "The AI isn't set up on this server yet, so clips are picked by loudness."}</span></div>`}
+  box.innerHTML = `${k.ready ? "" : `<div class="note">${ic("warn")}<span>${S.status.user?.is_admin ? "No AI key is set, so clip selection is paused. Add your key under Settings, AI." : "The AI isn't set up on this server, so clip selection is paused."}</span></div>`}
     <div class="tiles five" style="margin-top:${k.ready ? 0 : 16}px">
       <div class="tile"><i>${ic("bolt")}</i><b>${k.ready ? esc(k.provider || "Ready") : "Not set up"}</b><span>${k.ready && k.model ? esc(k.model) : "AI service"}</span></div>
       <div class="tile"><i>${ic("clock")}</i><b>${(k.today_calls || 0).toLocaleString()}</b><span>AI calls today</span></div>
@@ -2024,7 +2025,7 @@ async function drawSettings() {
   try {
     if (tab === "ai") {
       const k = S.ai = await api("/api/ai");
-      body.innerHTML = `<section class="set-sec"><h2>AI</h2><p class="help">PeakCut uses an AI model to pick the moments worth clipping and to write hooks, titles and captions. Use your own key from any of these services. You pay that service directly. Without a key, clips are picked by loudness.</p>
+      body.innerHTML = `<section class="set-sec"><h2>AI</h2><p class="help">PeakCut uses an AI model to pick the moments worth clipping and to write hooks, titles and captions. Use your own key from any of these services. You pay that service directly. Processing waits until an AI service is configured.</p>
           <div class="ai-state">${k.ready ? `<span class="pill ok">${ic("check")}Ready</span><span class="sub">${esc(k.label)} · ${esc(k.models[0] || "")}</span>` : `<span class="pill warn">Not set up</span><span class="sub">Choose a service, paste your key and pick a model.</span>`}</div>
           <div class="ai-form">
             <label class="f">AI service<select id="ai_provider">${k.providers.map(x => `<option value="${esc(x.id)}" ${x.id === k.provider ? "selected" : ""}>${esc(x.label)}</option>`).join("")}</select></label>
@@ -2238,8 +2239,15 @@ document.addEventListener("change", async e => {
   if (t.id === "ai_provider") { $("#ai_models").innerHTML = ""; if (S.ai && t.value !== S.ai.provider) { $("#ai_model").value = ""; $("#ai_base").value = ""; } return aiHints(); }
   if (t.dataset.sel) {
     const k = t.dataset.sel;
-    if (t.checked) sel().add(k); else sel().delete(k);
-    if (k.startsWith("j:")) (jobOf(k.slice(2))?.clips || []).forEach(c => sel().delete(`c:${k.slice(2)}:${c.id}`));   // the video covers its clips
+    if (k.startsWith("j:")) {
+      const jid = k.slice(2);
+      if (t.checked) { sel().add(k); (jobOf(jid)?.clips || []).forEach(c => { sel().delete(`c:${jid}:${c.id}`); sel().delete(`x:${jid}:${c.id}`); }); }
+      else { sel().delete(k); (jobOf(jid)?.clips || []).forEach(c => { sel().delete(`c:${jid}:${c.id}`); sel().delete(`x:${jid}:${c.id}`); }); }
+    } else if (k.startsWith("c:")) {
+      const [, jid, cid] = k.split(":");
+      if (t.checked) { sel().add(k); sel().delete(`x:${jid}:${cid}`); }
+      else { sel().delete(k); if (sel().has(`j:${jid}`)) sel().add(`x:${jid}:${cid}`); }
+    }
     return render();
   }
   if (t.dataset.every !== undefined) {
@@ -2347,7 +2355,7 @@ document.addEventListener("click", async e => {
     if (a === "selclear") { sel().clear(); return render(); }
     if (a === "selall") {
       const cid = creatorId();
-      (cid ? S.jobs.filter(j => j.creator === cid) : S.jobs).forEach(j => { if (!["queued", "running", "live"].includes(j.status)) { sel().add("j:" + j.id); j.clips.forEach(c => sel().delete(`c:${j.id}:${c.id}`)); } });
+      (cid ? S.jobs.filter(j => j.creator === cid) : S.jobs).forEach(j => { if (!["queued", "running", "live"].includes(j.status)) { sel().add("j:" + j.id); j.clips.forEach(c => { sel().delete(`c:${j.id}:${c.id}`); sel().delete(`x:${j.id}:${c.id}`); }); } });
       return render();
     }
     if (a === "seldel") {
@@ -2447,6 +2455,23 @@ document.addEventListener("click", async e => {
     if (a === "csave") return void await saveCreator();
     if (a === "cdiscard") { drawCreatorForm(); return toast("Changes discarded"); }
     if (a === "pause") { await send("/api/settings", {paused:!S.overview.paused}, "PUT"); return loadOverview(); }
+    if (a === "selqueue") {
+      const ids = selClips().map(x => x.split("."));
+      if (!ids.length) return toast("Select at least one finished clip first.", "bad");
+      b.disabled = true;
+      try {
+        const r = await send("/api/posts/batch", {clips: ids});
+        sel().clear(); drawSelBar(); await tick();
+        const bits = [];
+        if (r.queued) bits.push(`${r.queued} queued`);
+        if (r.already) bits.push(`${r.already} already queued`);
+        if (r.needs_retry) bits.push(`${r.needs_retry} need retry`);
+        if (r.rejected) bits.push(`${r.rejected} rejected`);
+        toast(bits.join(" · ") || "Nothing was queued.", r.needs_retry ? "bad" : r.rejected && !r.queued ? "bad" : "ok");
+        if (r.needs_retry) toast("An existing failed post needs retry. Open Publishing queue to retry it.", "bad");
+      } finally { b.disabled = false; }
+      return;
+    }
     if (a === "pcancel" || a === "pretry") { await api(`/api/posts/${d.id}/${a === "pcancel" ? "cancel" : "retry"}`, {method:"POST"}); return loadOverview(); }
     if (a === "ssave") { await saveSettings(); toast("Saved", "ok"); return drawSettings(); }
     if (a === "plansave") {

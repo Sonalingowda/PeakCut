@@ -68,6 +68,32 @@ def _remote_confirmed(p: dict) -> bool:
     return p.get("status") == "posted"
 
 
+def _occupies_clip_account(p: dict) -> bool:
+    """Every retained post record blocks a new record; retry reuses failed records safely."""
+    if p.get("status") in ("cancelled", "deleted"):
+        return False
+    return True
+
+
+def existing_accounts(job, clip, account_ids) -> set:
+    """Accounts that already have an active, completed, or remotely-known post for this clip."""
+    wanted = {str(aid) for aid in account_ids}
+    with _lock:
+        return {p["account"] for p in _posts
+                if p.get("user") == ctx.uid() and p.get("job") == job["id"]
+                and p.get("clip") == clip["id"] and p.get("account") in wanted
+                and _occupies_clip_account(p)}
+
+
+def _existing_for_clip(job, clip, account_ids):
+    """Return retained post records for one clip; caller holds _lock."""
+    wanted = {str(aid) for aid in account_ids}
+    return [p for p in _posts
+            if p.get("user") == ctx.uid() and p.get("job") == job["id"]
+            and p.get("clip") == clip["id"] and p.get("account") in wanted
+            and _occupies_clip_account(p)]
+
+
 def _cleanup_confirmed(p: dict, job: dict, clip: dict) -> None:
     """Best-effort cleanup; a cleanup problem must never turn a confirmed upload into a failure."""
     with _lock:
@@ -115,32 +141,47 @@ def _next_slot(account_id, gap_min, cap):
 
 
 def enqueue(job, clip, account_ids, now=False) -> list:
-    c = creators.get(job["creator"]) or creators.DEFAULTS
-    made = []
+    result = enqueue_batch([(job, clip, account_ids)], now=now)[0]
+    return result["made"]
+
+
+def enqueue_batch(items, now=False) -> list:
+    """Atomically queue several clips and return one result for each input item.
+
+    The existing-record check and creation happen under one lock. That makes two
+    concurrent batch requests idempotent without changing the upload state machine.
+    """
+    made_all = []
+    results = []
     with _lock:
-        for aid in account_ids:
-            acc = accounts.get(aid)
-            if not acc:
-                continue
-            if any(p["job"] == job["id"] and p["clip"] == clip["id"] and p["account"] == aid
-                   and p["status"] in OPEN + ("posted", "uploaded", "uncertain") for p in _mine()):
-                continue  # never post the same clip to the same account twice
-            due = time.time() if now else _next_slot(aid, c["post_gap_min"], c["daily_cap"])
-            p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job["creator"],
-                 "account": aid, "account_name": acc["name"], "platform": acc["platform"], "status": "scheduled",
-                 "due_at": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
-                 "score": clip.get("score", 0), "category": clip.get("category", "other"), "tries": 0, "url": "", "remote_id": "", "error": None,
-                 "views": None, "metrics": None, "remote_state": "local_queued",
-                 "schedule_requested": bool(not now and acc["platform"] == "youtube"), "scheduled_publish_at": None,
-                 "published_at": None, "upload_confirmed_at": None, "processing_confirmed_at": None,
-                 "upload_session_url": None, "upload_session_started_at": None, "schedule_requested_at": None,
-                 "schedule_requested_iso": None}
-            _posts.append(p)
-            made.append(p)
+        for job, clip, account_ids in items:
+            creator = creators.get(job["creator"]) or creators.DEFAULTS
+            existing = _existing_for_clip(job, clip, account_ids)
+            existing_by_account = {p["account"]: p for p in existing}
+            made = []
+            for aid in account_ids:
+                acc = accounts.get(aid)
+                if not acc or aid in existing_by_account:
+                    continue  # never post the same clip to the same account twice
+                due = time.time() if now else _next_slot(aid, creator["post_gap_min"], creator["daily_cap"])
+                p = {"id": secrets.token_hex(8), "user": ctx.uid(), "job": job["id"], "clip": clip["id"], "creator": job["creator"],
+                     "account": aid, "account_name": acc["name"], "platform": acc["platform"], "status": "scheduled",
+                     "due_at": due, "created": time.time(), "title": clip.get("title") or clip.get("hook") or "Clip",
+                     "score": clip.get("score", 0), "category": clip.get("category", "other"), "tries": 0, "url": "", "remote_id": "", "error": None,
+                     "views": None, "metrics": None, "remote_state": "local_queued",
+                     "schedule_requested": bool(not now and acc["platform"] == "youtube"), "scheduled_publish_at": None,
+                     "published_at": None, "upload_confirmed_at": None, "processing_confirmed_at": None,
+                     "upload_session_url": None, "upload_session_started_at": None, "schedule_requested_at": None,
+                     "schedule_requested_iso": None}
+                _posts.append(p)
+                made.append(p)
+                made_all.append(p)
+            results.append({"made": made, "existing": existing,
+                            "needs_retry": sum(1 for p in existing if p.get("status") == "failed")})
         _save()
-    for p in made:
+    for p in made_all:
         _mirror(p)
-    return made
+    return results
 
 
 def on_clip_ready(job, clip):
