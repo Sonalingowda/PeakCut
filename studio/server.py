@@ -1537,6 +1537,15 @@ def reconcile_post(pid: str):
         raise HTTPException(502, str(e))
 
 
+@app.post("/api/posts/{pid}/upload-only")
+def upload_only_post(pid: str):
+    """Enable one untouched private YouTube post without creating a second record."""
+    try:
+        return posting.make_upload_only(pid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 @app.post("/api/posts/{pid}/{action}")
 def post_action(pid: str, action: str):
     try:

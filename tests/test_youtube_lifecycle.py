@@ -462,11 +462,32 @@ def main():
          patch.object(posting.creators, "get", return_value=creator), patch.object(posting.jobs, "save"), \
          patch.object(posting, "_save"), patch.object(posting, "_mirror"), patch.object(posting.creators, "log"), \
          patch.object(posting.accounts, "youtube_upload") as insert, \
-         patch.object(posting.accounts, "youtube_confirm_upload", return_value=public_confirmation):
+         patch.object(posting.accounts, "youtube_confirm_upload", return_value=public_confirmation), \
+         patch.object(posting.accounts, "youtube_schedule") as schedule:
         with ctx.as_user("user01"):
             posting._post(p)
     assert p["remote_state"] == "published" and p["published_at"] == "2099-01-01T01:02:03Z"
-    assert p["posted_at"] == 4070912523.0 and not insert.called
+    assert p["posted_at"] == 4070912523.0 and not insert.called and not schedule.called
+
+    # Upload-only mode also leaves a private YouTube video unscheduled.
+    (post_root / "clips").mkdir(exist_ok=True)
+    (post_root / "clips" / "clip1.mp4").write_bytes(b"private")
+    private_creator = {**creator, "privacy": "private"}
+    p.update(status="posting", remote_state="uploaded", schedule_requested=False, remote_id="yt-private",
+             cleanup_job=None, published_at=None, posted_at=None, tries=0, error=None)
+    private_confirmation = {"status": {"uploadStatus": "processed", "privacyStatus": "private"}, "snippet": {}}
+    with patch.object(posting.jobs, "get", return_value=job), patch.object(posting.accounts, "get", return_value=acc), \
+         patch.object(posting.creators, "get", return_value=private_creator), patch.object(posting.jobs, "save"), \
+         patch.object(posting, "_save"), patch.object(posting, "_mirror"), patch.object(posting.creators, "log"), \
+         patch.object(posting.accounts, "youtube_upload") as insert, \
+         patch.object(posting.accounts, "youtube_confirm_upload", return_value=private_confirmation), \
+         patch.object(posting.accounts, "youtube_schedule") as schedule:
+        with ctx.as_user("user01"):
+            posting._post(p)
+    assert p["status"] == "posted" and p["remote_state"] == "uploaded_private"
+    assert not insert.called and not schedule.called
+    p.update(status="posting", remote_state="uploaded", schedule_requested=False, remote_id="yt-public",
+             cleanup_job=None, published_at=None, posted_at=None, tries=0, error=None)
 
     # Missing publication time is recoverable and retains the remote id; it is
     # not reported as published and does not create another upload.

@@ -275,6 +275,34 @@ def enqueue_batch(items, now=False) -> list:
     return results
 
 
+def make_upload_only(pid):
+    """Atomically convert one untouched queued YouTube post to upload-only mode."""
+    with _lock:
+        p = next((x for x in _posts if x.get("user") == ctx.uid() and x.get("id") == pid), None)
+        if not p:
+            raise ValueError("That post does not belong to this account.")
+        if (p.get("platform") != "youtube" or p.get("status") != "scheduled"
+                or p.get("remote_state") != "local_queued" or not p.get("schedule_requested")):
+            raise ValueError("Only an untouched queued YouTube post can be changed to upload-only mode.")
+        if (p.get("remote_id") or p.get("upload_session_url") or p.get("tries")
+                or p.get("upload_confirmed_at") or p.get("processing_confirmed_at")
+                or p.get("scheduled_publish_at") or p.get("published_at")):
+            raise ValueError("This post has upload or lifecycle history and cannot be changed to upload-only mode safely.")
+        creator = creators.get(p.get("creator"))
+        account = accounts.get(p.get("account"))
+        if not creator or creator.get("privacy") != "private":
+            raise ValueError("The creator must be configured for private YouTube publishing first.")
+        if not account or account.get("platform") != "youtube":
+            raise ValueError("The assigned YouTube account is no longer connected.")
+        p.update(schedule_requested=False, due_at=time.time(), schedule_requested_at=None,
+                 schedule_requested_iso=None, upload_only=True)
+        _save()
+    _mirror(p)
+    return {"id": p["id"], "status": p["status"], "remote_state": p["remote_state"],
+            "schedule_requested": p["schedule_requested"], "remote_id": p.get("remote_id"),
+            "upload_only": True}
+
+
 def on_clip_ready(job, clip):
     """Called once when a clip first finishes rendering."""
     c = creators.get(job["creator"])

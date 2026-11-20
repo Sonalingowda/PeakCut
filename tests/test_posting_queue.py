@@ -137,6 +137,24 @@ def run():
                 posting.on_clip_ready({"id": "auto-job", "creator": "creator1"}, auto_clip)
                 enqueue.assert_not_called()
 
+            upload_only = {"id": "upload-only", "user": USER, "job": JOB["id"], "clip": "clip1", "creator": "creator1",
+                           "account": "yt1", "platform": "youtube", "status": "scheduled", "remote_state": "local_queued",
+                           "schedule_requested": True, "remote_id": "", "upload_session_url": None, "tries": 0,
+                           "upload_confirmed_at": None, "processing_confirmed_at": None, "scheduled_publish_at": None,
+                           "published_at": None, "due_at": 9999999999}
+            posting._posts[:] = [upload_only]
+            with patch.object(posting.creators, "get", return_value={**CREATOR, "privacy": "private"}):
+                converted = posting.make_upload_only("upload-only")
+            assert converted["id"] == "upload-only" and converted["schedule_requested"] is False
+            assert upload_only["remote_state"] == "local_queued" and upload_only["remote_id"] == ""
+            with ctx.as_user("another-user"):
+                try:
+                    posting.make_upload_only("upload-only")
+                except ValueError as e:
+                    assert "does not belong" in str(e)
+                else:
+                    raise AssertionError("another user converted an owned post")
+
             # Reporting must distinguish confirmed publication from a private upload,
             # scheduled upload, and an uncertain outcome.
             posting._posts[:] = [
@@ -192,6 +210,7 @@ def run():
     assert 'remote_state === "published"' in html
     assert 'scheduled_publish_at' in html and 'creator_timezone' in html and 'postDayKey' in html
     assert 'data-act="pretry"' in html and 'Reconcile' in html
+    assert 'data-act="pupload"' in html and '/upload-only' in html
 
     print("ALL PASSED")
 
