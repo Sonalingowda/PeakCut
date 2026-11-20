@@ -137,6 +137,28 @@ def run():
                 posting.on_clip_ready({"id": "auto-job", "creator": "creator1"}, auto_clip)
                 enqueue.assert_not_called()
 
+            # Reporting must distinguish confirmed publication from a private upload,
+            # scheduled upload, and an uncertain outcome.
+            posting._posts[:] = [
+                {"user": USER, "creator": "creator1", "status": "posted", "remote_state": "uploaded_private", "due_at": 10, "views": None},
+                {"user": USER, "creator": "creator1", "status": "posted", "remote_state": "published", "posted_at": 20, "due_at": 20, "views": None},
+                {"user": USER, "creator": "creator1", "status": "youtube_scheduled", "remote_state": "scheduled", "due_at": 30,
+                 "scheduled_publish_at": "2030-01-01T12:00:00Z", "processing_confirmed_at": 1, "views": None},
+                {"user": USER, "creator": "creator1", "status": "uncertain", "remote_state": "uncertain", "due_at": 40, "views": None},
+            ]
+            with patch.object(posting.creators, "all_creators", return_value=[{**CREATOR, "name": "JOLTROOM", "timezone": "Asia/Kolkata", "auto_watch": False, "channel": "", "autopost": False, "rate_per_1k": 0}]), \
+                 patch.object(posting.jobs, "list_jobs", return_value=[]), \
+                 patch.object(posting.accounts, "settings", return_value={"paused": False, "discord_webhook": "", "telegram_token": "", "telegram_chat": ""}), \
+                 patch.object(posting.alerts, "configured", return_value=False), \
+                 patch.object(posting.live, "active_mine", return_value=[]):
+                report = posting.overview()
+            assert report["publishing"] == {"queued": 0, "scheduled": 1, "published": 1,
+                                            "failed": 0, "uncertain": 1, "needs_attention": 1,
+                                            "next": report["publishing"]["next"]}
+            assert sum(1 for p in report["publishing_posts"] if p.get("remote_state") == "published") == 1
+            assert all(p.get("remote_state") != "uploaded_private" or p.get("status") != "posted"
+                       for p in report["publishing_posts"] if p.get("remote_state") == "published")
+
     html = Path("web/index.html").read_text(encoding="utf-8")
     assert 'sel().add(`x:${jid}:${cid}`)' in html
     assert 'blocked.has(id + "." + c.id)' in html
@@ -144,6 +166,9 @@ def run():
     assert 'const dl = selClips().length, n = dl' in html
     assert 'sel().has("j:" + j.id) && !sel().has("x:" + j.id + ":" + c.id)' in html
     assert 'need retry' in html
+    assert 'remote_state === "published"' in html
+    assert 'scheduled_publish_at' in html and 'creator_timezone' in html and 'postDayKey' in html
+    assert 'data-act="pretry"' in html and 'Reconcile' in html
 
     print("ALL PASSED")
 

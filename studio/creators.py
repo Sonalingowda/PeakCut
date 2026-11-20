@@ -4,6 +4,7 @@ import json
 import re
 import threading
 import time
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 from . import config, ctx
@@ -20,7 +21,7 @@ DEFAULTS = {"name": "", "channel": "", "style": "bounce", "layout": "blur", "cap
             "game": "",
             "trigger_words": "clip that, clip it",
             "autopost": False, "accounts": [], "post_min_score": 75, "post_gap_min": 45, "daily_cap": 6,
-            "privacy": "public", "post_footer": "", "rate_per_1k": 0.0, "channels": {}}
+            "privacy": "public", "post_footer": "", "rate_per_1k": 0.0, "channels": {}, "timezone": "Asia/Kolkata"}
 PLATFORMS = ("youtube", "twitch", "kick")
 
 
@@ -80,6 +81,12 @@ def _clean(data: dict) -> dict:
             v = v if v in ("both", "either") else "both"
         elif k == "privacy":
             v = v if v in ("public", "unlisted", "private") else "public"
+        elif k == "timezone":
+            v = str(v).strip()[:80] or "Asia/Kolkata"
+            try:
+                ZoneInfo(v)
+            except Exception as e:  # noqa: BLE001
+                raise ValueError("Timezone must be a valid IANA timezone, such as Asia/Kolkata.") from e
         else:
             v = str(v).strip()[:300]
         out[k] = v

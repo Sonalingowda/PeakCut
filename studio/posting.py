@@ -422,9 +422,20 @@ def overview() -> dict:
             "queued": sum(1 for p in ps if p["status"] in OPEN), "failed": sum(1 for p in ps if p["status"] == "failed"),
             "views": views, "earnings": round(views / 1000 * c["rate_per_1k"], 2)})
     names = {c["id"]: c["name"] for c in all_cs}
+    timezones = {c["id"]: c.get("timezone") or "Asia/Kolkata" for c in all_cs}
     queue = sorted((p for p in _posts if p["status"] in OPEN), key=lambda p: p["due_at"])
     done = sorted((p for p in _posts if p["status"] in ("posted", "youtube_scheduled", "uploaded", "uncertain", "failed")), key=lambda p: -(p.get("posted_at") or p.get("due_at", 0)))[:15]
-    show = [{**{k: v for k, v in p.items() if k != "user"}, "creator_name": names.get(p["creator"], "")} for p in queue + done]
+    public = lambda p: {**{k: v for k, v in p.items() if k != "user"}, "creator_name": names.get(p["creator"], ""),
+                        "creator_timezone": timezones.get(p["creator"], "Asia/Kolkata")}
+    show = [public(p) for p in queue + done]
+    all_public = [public(p) for p in sorted(_posts, key=lambda p: -(p.get("posted_at") or p.get("due_at", 0)))]
+    published = [p for p in _posts if p.get("remote_state") == "published"]
+    scheduled = [p for p in _posts if p.get("status") == "youtube_scheduled"]
+    waiting = [p for p in _posts if p.get("status") in OPEN]
+    failed = [p for p in _posts if p.get("status") == "failed"]
+    uncertain = [p for p in _posts if p.get("status") == "uncertain"]
+    next_post = min((p for p in _posts if p.get("status") in OPEN or p.get("status") == "youtube_scheduled"),
+                    key=lambda p: p.get("due_at") or float("inf"), default=None)
     # last 14 days, oldest first, for the home graph
     days = [_day(time.time() - 86400 * i) for i in range(13, -1, -1)]
     made, posted, views = {d: 0 for d in days}, {d: 0 for d in days}, {d: 0 for d in days}
@@ -438,8 +449,11 @@ def overview() -> dict:
             posted[_day(p["posted_at"])] += 1
             views[_day(p["posted_at"])] += p["views"] or 0
     daily = [{"day": d, "clips": made[d], "posted": posted[d], "views": views[d]} for d in days]
-    return {"paused": accounts.settings()["paused"], "creators": rows, "posts": show, "daily": daily,
-            "alerts": alerts.configured(), "recording": len(live.active_mine())}
+    return {"paused": accounts.settings()["paused"], "creators": rows, "posts": show, "publishing_posts": all_public,
+            "publishing": {"queued": len(waiting), "scheduled": len(scheduled), "published": len(published),
+                           "failed": len(failed), "uncertain": len(uncertain), "needs_attention": len(failed) + len(uncertain),
+                           "next": public(next_post) if next_post else None},
+            "daily": daily, "alerts": alerts.configured(), "recording": len(live.active_mine())}
 
 
 def digest_text() -> str:
