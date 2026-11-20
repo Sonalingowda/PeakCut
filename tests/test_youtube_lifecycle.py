@@ -217,6 +217,26 @@ def main():
     assert p["status"] == "youtube_scheduled" and p["scheduled_publish_at"] == "2099-01-01T00:00:00Z"
     assert not (post_root / "clips" / "clip1.mp4").exists() and not (post_root / "source.mp4").exists()
 
+    # A persisted remote id with a historical publication is reconciled before
+    # the worker can call scheduling, without creating another upload.
+    (post_root / "clips").mkdir(exist_ok=True)
+    (post_root / "clips" / "clip1.mp4").write_bytes(b"video")
+    p.update(status="scheduled", remote_id="yt-existing", url="https://youtu.be/yt-existing", remote_state="scheduling",
+             schedule_requested=True, scheduled_publish_at=None, published_at=None, tries=0, error="old scheduling error")
+    remote_private = {"id": "yt-existing", "status": {"uploadStatus": "processed", "privacyStatus": "private"},
+                      "snippet": {"publishedAt": "2099-01-01T00:00:00Z"}}
+    with patch.object(posting.jobs, "get", return_value=job), patch.object(posting.accounts, "get", return_value=acc), \
+         patch.object(posting.creators, "get", return_value=creator), patch.object(posting.jobs, "save"), \
+         patch.object(posting, "_save"), patch.object(posting, "_mirror"), \
+         patch.object(posting.accounts, "youtube_video_status", return_value=remote_private) as status_get, \
+         patch.object(posting.accounts, "youtube_upload") as insert, patch.object(posting.accounts, "youtube_schedule") as schedule:
+        with ctx.as_user("user01"):
+            posting._post(p)
+    assert p["status"] == "posted" and p["remote_state"] == "uploaded_private"
+    assert p["published_at"] is None and p["scheduled_publish_at"] is None and p["remote_id"] == "yt-existing"
+    status_get.assert_called_once_with(acc, "yt-existing")
+    insert.assert_not_called() and schedule.assert_not_called()
+
     # A schedule failure keeps the remote id and all retry material.
     (post_root / "clips").mkdir(exist_ok=True)
     (post_root / "clips" / "clip1.mp4").write_bytes(b"video")
@@ -422,7 +442,7 @@ def main():
     (post_root / "clips" / "clip1.mp4").write_bytes(b"retry cleanup")
     (post_root / "source.mp4").write_bytes(b"retry source")
     p.update(platform="youtube", status="youtube_scheduled", remote_state="scheduled", remote_id="yt-existing",
-             processing_confirmed_at=time.time(), cleanup_job="partial")
+             scheduled_publish_at="2099-01-01T00:00:00Z", processing_confirmed_at=time.time(), cleanup_job="partial")
     posting._posts[:] = [p]
     with patch.object(posting.jobs, "get", return_value=job), patch.object(posting, "_save"), \
          patch.object(posting, "_mirror"), patch.object(posting.threading, "Thread"):
@@ -557,7 +577,8 @@ def main():
     schedule_p = posting._posts[0]
     with patch.object(posting.jobs, "get", return_value=schedule_job), patch.object(posting.creators, "get", return_value=creator), \
          patch.object(posting.accounts, "get", return_value=acc), patch.object(posting.jobs, "save"), \
-         patch.object(posting, "_mirror"), patch.object(posting.accounts, "youtube_confirm_upload", return_value={"status": {"uploadStatus": "processed", "privacyStatus": "private"}}), \
+         patch.object(posting, "_mirror"), patch.object(posting.accounts, "youtube_video_status", return_value={"id": "yt-schedule", "status": {"uploadStatus": "processed", "privacyStatus": "private"}, "snippet": {}}), \
+         patch.object(posting.accounts, "youtube_confirm_upload", return_value={"status": {"uploadStatus": "processed", "privacyStatus": "private"}}), \
          patch.object(posting.accounts, "youtube_upload") as insert, \
          patch.object(posting.accounts, "youtube_schedule", return_value={"publishAt": "2099-01-01T00:00:00Z"}):
         with ctx.as_user("user01"):

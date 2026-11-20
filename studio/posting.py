@@ -68,6 +68,97 @@ def _remote_confirmed(p: dict) -> bool:
     return p.get("status") == "posted"
 
 
+def _apply_youtube_evidence(p: dict, item: dict, allow_eligible: bool = False):
+    """Apply one authoritative YouTube status response without uploading or scheduling."""
+    if item.get("id") != p.get("remote_id"):
+        raise ValueError("YouTube returned a different video id during reconciliation.")
+    status, snippet = item.get("status") or {}, item.get("snippet") or {}
+    upload, privacy, published_at, publish_at = (status.get("uploadStatus"), status.get("privacyStatus"),
+                                                  snippet.get("publishedAt"), status.get("publishAt"))
+    if upload != "processed":
+        p.update(status="uncertain", remote_state="uncertain",
+                 error=f"YouTube status is {upload or 'unknown'}; publication could not be established.",
+                 reconciliation_note="Reconciliation stopped because YouTube has not confirmed processing.")
+        return "uncertain"
+    if published_at:
+        try:
+            normalized = accounts.normalize_youtube_timestamp(published_at)
+        except (TypeError, ValueError) as e:
+            p.update(status="uncertain", remote_state="uncertain", error=f"YouTube returned an invalid publishedAt: {e}",
+                     reconciliation_note="Reconciliation stopped because YouTube returned an invalid publication timestamp.")
+            return "uncertain"
+        current_state = "published" if privacy == "public" else "uploaded_private"
+        p.update(status="posted", remote_state=current_state, published_at=normalized if current_state == "published" else None,
+                 scheduled_publish_at=None, remote_visibility=privacy or "unknown", remote_published_at=normalized,
+                 error=None, reconciliation_note=("Reconciled from YouTube: the video has a historical publishedAt of "
+                                                  f"{normalized}, but its current visibility is {privacy or 'unknown'}; it was not scheduled again."))
+        if current_state == "published":
+            p["posted_at"] = _dt.datetime.fromisoformat(normalized.replace("Z", "+00:00")).timestamp()
+        return current_state
+    if publish_at:
+        try:
+            normalized = accounts.normalize_youtube_timestamp(publish_at)
+        except (TypeError, ValueError) as e:
+            p.update(status="uncertain", remote_state="uncertain", error=f"YouTube returned an invalid publishAt: {e}",
+                     reconciliation_note="Reconciliation stopped because YouTube returned an invalid schedule timestamp.")
+            return "uncertain"
+        if privacy != "private":
+            p.update(status="uncertain", remote_state="uncertain", error="YouTube has a schedule but its visibility is not private.",
+                     reconciliation_note="Reconciliation stopped because the scheduled video has an unexpected visibility.")
+            return "uncertain"
+        p.update(status="youtube_scheduled", remote_state="scheduled", scheduled_publish_at=normalized,
+                 remote_visibility=privacy, processing_confirmed_at=time.time(), error=None,
+                 reconciliation_note="Reconciled from YouTube's existing publication schedule; no new schedule was sent.")
+        return "scheduled"
+    if privacy == "private" and allow_eligible:
+        p.update(status="posted", remote_state="uploaded_private", published_at=None, scheduled_publish_at=None,
+                 remote_visibility="private", error=None,
+                 reconciliation_note="Reconciled from YouTube: processed and currently private, with no publishAt or historical publishedAt.")
+        return "uploaded_private"
+    if privacy != "private":
+        p.update(status="uncertain", remote_state="uncertain", error=f"YouTube visibility is {privacy or 'unknown'} without a publication timestamp.",
+                 reconciliation_note="Reconciliation stopped because YouTube returned an unexpected visibility.")
+        return "uncertain"
+    return None
+
+
+def reconcile(pid):
+    """Read one existing YouTube video and reconcile its local lifecycle without side effects remotely."""
+    with _lock:
+        p = next((x for x in _posts if x.get("user") == ctx.uid() and x.get("id") == pid), None)
+        if not p:
+            raise ValueError("That post does not belong to this account.")
+        if p.get("platform") != "youtube" or not p.get("remote_id"):
+            raise ValueError("Only an existing YouTube remote video can be reconciled.")
+        remote_id, account_id = p["remote_id"], p["account"]
+    acc = accounts.get(account_id)
+    if not acc:
+        raise ValueError("The YouTube account is disconnected; the remote state could not be verified.")
+    try:
+        item = accounts.youtube_video_status(acc, remote_id)
+    except Exception as e:  # noqa: BLE001
+        with _lock:
+            current = next((x for x in _posts if x.get("user") == ctx.uid() and x.get("id") == pid), None)
+            if current:
+                current.update(status="uncertain", remote_state="uncertain", error=f"Could not verify YouTube state: {str(e)[:300]}",
+                               reconciliation_note="Reconciliation could not establish the remote state; the remote id and upload history were retained.")
+                _save()
+        if current:
+            _mirror(current)
+        raise
+    with _lock:
+        current = next((x for x in _posts if x.get("user") == ctx.uid() and x.get("id") == pid), None)
+        if not current or current.get("remote_id") != remote_id:
+            raise ValueError("The post changed while YouTube was being checked; no reconciliation was applied.")
+        _apply_youtube_evidence(current, item, allow_eligible=True)
+        _save()
+    _mirror(current)
+    return {"id": pid, "status": current["status"], "remote_state": current["remote_state"],
+            "remote_id": current.get("remote_id"), "published_at": current.get("published_at"),
+            "scheduled_publish_at": current.get("scheduled_publish_at"), "error": current.get("error"),
+            "reconciliation_note": current.get("reconciliation_note")}
+
+
 def _occupies_clip_account(p: dict) -> bool:
     """Every retained post record blocks a new record; retry reuses failed records safely."""
     if p.get("status") in ("cancelled", "deleted"):
@@ -228,6 +319,24 @@ def _post(p):
                 accounts.require_youtube_schedule_scope(acc)
             rid, url = p.get("remote_id"), p.get("url")
             confirmed = None
+            # A persisted remote id must be checked before any scheduling call. A
+            # prior publication (or an already accepted schedule) is reconciled
+            # from YouTube evidence; it is never uploaded or scheduled again.
+            if scheduled and rid:
+                try:
+                    remote = accounts.youtube_video_status(acc, rid)
+                    outcome = _apply_youtube_evidence(p, remote)
+                    if outcome:
+                        _save()
+                        _mirror(p)
+                        return
+                except Exception as e:  # noqa: BLE001
+                    p.update(status="uncertain", remote_state="uncertain", error=f"Could not verify YouTube state before scheduling: {str(e)[:300]}",
+                              reconciliation_note="Scheduling was blocked because the existing remote video's state could not be established.")
+                    p["tries"] += 1
+                    _save()
+                    _mirror(p)
+                    return
             def remember_session(session):
                 p.update(upload_session_url=session, upload_session_started_at=time.time(), remote_state="upload_session")
                 _save()

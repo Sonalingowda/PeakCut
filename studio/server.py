@@ -1526,6 +1526,17 @@ def add_posts_batch(body: dict = Body(...)):
     return {**totals, "results": results}
 
 
+@app.post("/api/posts/{pid}/reconcile")
+def reconcile_post(pid: str):
+    """Reconcile one existing remote post from platform evidence; never uploads or schedules."""
+    try:
+        return posting.reconcile(pid)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, str(e))
+
+
 @app.post("/api/posts/{pid}/{action}")
 def post_action(pid: str, action: str):
     try:

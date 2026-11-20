@@ -159,6 +159,29 @@ def run():
             assert all(p.get("remote_state") != "uploaded_private" or p.get("status") != "posted"
                        for p in report["publishing_posts"] if p.get("remote_state") == "published")
 
+            reconcile_post = {"id": "reconcile1", "user": USER, "job": JOB["id"], "clip": "clip1", "creator": "creator1",
+                              "account": "yt1", "platform": "youtube", "status": "scheduled", "remote_state": "scheduling",
+                              "remote_id": "yt-existing", "url": "https://youtube.com/shorts/yt-existing", "scheduled_publish_at": None,
+                              "published_at": None, "upload_session_url": None, "error": "old guard error"}
+            posting._posts[:] = [reconcile_post]
+            remote_private = {"id": "yt-existing", "status": {"uploadStatus": "processed", "privacyStatus": "private"},
+                              "snippet": {"publishedAt": "2030-01-01T00:00:00Z"}}
+            with patch.object(posting.accounts, "youtube_video_status", return_value=remote_private) as status_get, \
+                 patch.object(posting.accounts, "youtube_upload") as upload, patch.object(posting.accounts, "youtube_schedule") as schedule:
+                result = posting.reconcile("reconcile1")
+            assert result["remote_state"] == "uploaded_private" and reconcile_post["status"] == "posted"
+            assert reconcile_post["published_at"] is None and reconcile_post["scheduled_publish_at"] is None
+            assert reconcile_post["remote_id"] == "yt-existing" and "historical publishedAt" in reconcile_post["reconciliation_note"]
+            status_get.assert_called_once_with(ACCOUNTS["yt1"], "yt-existing")
+            upload.assert_not_called() and schedule.assert_not_called()
+            with ctx.as_user("another-user"):
+                try:
+                    posting.reconcile("reconcile1")
+                except ValueError as e:
+                    assert "does not belong" in str(e)
+                else:
+                    raise AssertionError("another user reconciled an owned post")
+
     html = Path("web/index.html").read_text(encoding="utf-8")
     assert 'sel().add(`x:${jid}:${cid}`)' in html
     assert 'blocked.has(id + "." + c.id)' in html
