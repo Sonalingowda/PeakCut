@@ -77,6 +77,37 @@ def run():
                     raise AssertionError("a disconnected account was accepted")
             assert len(posting._posts) == before
 
+            for body, expected in (({"job": "job12345", "clip": "clip2", "accounts": []}, "No account was selected"),
+                                   ({"job": "job12345", "clip": "clip2", "accounts": ["missing"]}, "disconnected")):
+                try:
+                    server.add_posts(body)
+                except HTTPException as e:
+                    assert expected.lower() in str(e.detail).lower()
+                else:
+                    raise AssertionError("invalid single-clip queue request was accepted")
+
+            posting._posts[:] = [{"id": "failed-single", "user": USER, "job": JOB["id"], "clip": "clip2",
+                                  "account": "yt1", "status": "failed", "remote_state": "uploaded",
+                                  "remote_id": "yt-known", "upload_session_url": None}]
+            try:
+                server.add_posts({"job": "job12345", "clip": "clip2", "accounts": ["yt1"]})
+            except HTTPException as e:
+                assert "existing failed post" in e.detail["message"] and "Retry" in e.detail["message"]
+            else:
+                raise AssertionError("failed post was silently treated as a new queue item")
+
+            posting._posts[:] = [{"id": "uncertain-single", "user": USER, "job": JOB["id"], "clip": "clip2",
+                                  "account": "yt1", "status": "uncertain", "remote_state": "uncertain",
+                                  "remote_id": "", "upload_session_url": None}]
+            try:
+                server.add_posts({"job": "job12345", "clip": "clip2", "accounts": ["yt1"]})
+            except HTTPException as e:
+                assert "uncertain existing post" in e.detail["message"] and "duplicate" in e.detail["message"]
+            else:
+                raise AssertionError("uncertain post was silently treated as a new queue item")
+            posting._posts[:] = [{"user": USER, "job": JOB["id"], "clip": "clip1", "account": aid,
+                                  "status": "scheduled", "remote_state": "local_queued", "due_at": 1} for aid in ("yt1", "ig1")]
+
             many = server.add_posts_batch({"clips": [["job12345", "clip2"], ["job12345", "clip3"]]})
             assert many["queued"] == 4 and len(posting._posts) == 6
             assert not any(p["clip"] == "clip1" for p in posting._posts[2:])
@@ -210,6 +241,7 @@ def run():
     assert 'remote_state === "published"' in html
     assert 'scheduled_publish_at' in html and 'creator_timezone' in html and 'postDayKey' in html
     assert 'data-act="pretry"' in html and 'Reconcile' in html
+    assert 'Needs reconciliation' in html and 'already has a publishing record' in html
     assert 'data-act="pupload"' in html and '/upload-only' in html
 
     print("ALL PASSED")

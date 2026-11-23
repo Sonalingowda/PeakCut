@@ -273,6 +273,7 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     if layout == "gameplay" and not (face and len(face) == 4):
         layout = "crop"     # no webcam found: the game fills the screen, which is still the right shape
     hook_y = _hook_y(layout, hook_y, face)
+    voice = clip.get("voice_file")          # a finished voiceover (path) to lay over the start, or nothing
     ass = build_ass(words if clip.get("captions", True) else [], start, end, clip.get("hook", ""), clip.get("style", "bounce"),
                     clip.get("highlight_words", []), hook_y, cap_y)
     # The clip is made in a short work folder and moved into place afterwards. The caption step of ffmpeg cannot
@@ -281,20 +282,41 @@ def render_clip(src: Path, out_dir: Path, name: str, clip: dict, words: list, sr
     # break the filter syntax).
     work = Path(tempfile.mkdtemp(prefix="pk"))
     try:
-        return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass, face=face)
+        return _render_in(work, src, out_dir, name, start, end, layout, fg_h, ass, face=face, voice=voice)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
 
-def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str, face=None) -> dict:
+VOICE_GAIN = 1.5          # the voice is made a little louder than the game, so the take is heard over it
+VOICE_LEAD = 0.3          # seconds of the stream's own sound before the voice comes in
+
+
+def _audio_graph(voice: bool, seconds: float = 0.0) -> str:
+    """The audio part of the filter graph, ending in [a]. With a voice, the stream's sound is pushed down while
+    the voice speaks (sidechain ducking) and comes back after; without one it is exactly the old behaviour."""
+    if not voice:
+        return "[0:a:0]loudnorm=I=-14:TP=-1.5:LRA=11[a]"
+    d = int(VOICE_LEAD * 1000)
+    return (f"[1:a]adelay={d}|{d},volume={VOICE_GAIN},apad=whole_dur={seconds:.2f},asplit=2[vo][key];"
+            f"[0:a:0][key]sidechaincompress=threshold=0.015:ratio=10:attack=15:release=400[duck];"
+            f"[duck][vo]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+            f"loudnorm=I=-14:TP=-1.5:LRA=11[a]")
+
+
+def _render_in(work: Path, src: Path, out_dir: Path, name: str, start, end, layout, fg_h, ass: str, face=None, voice=None) -> dict:
     global _qsv_ok
     (work / f"{name}.ass").write_text(ass, encoding="utf-8")
     (work / "f").mkdir()
     for f in config.FONTS_DIR.glob("*.ttf"):
         shutil.copyfile(f, work / "f" / f.name)
-    fc = _filter(layout, fg_h, face) + f"[v0]ass=filename={name}.ass:fontsdir=f[v]"
-    base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}", "-i", str(src),
-            "-filter_complex", fc, "-map", "[v]", "-map", "0:a:0", "-af", "loudnorm=I=-14:TP=-1.5:LRA=11",
+    vfile = None
+    if voice and Path(str(voice)).is_file():
+        vfile = "voice.mp3"                  # copied in beside the captions: short, relative, no drive colon
+        shutil.copyfile(str(voice), work / vfile)
+    fc = _filter(layout, fg_h, face) + f"[v0]ass=filename={name}.ass:fontsdir=f[v];" + _audio_graph(bool(vfile), end - start)
+    inputs = ["-i", str(src)] + (["-i", vfile] if vfile else [])
+    base = ["ffmpeg", "-y", "-v", "error", "-ss", f"{start:.2f}", "-t", f"{end - start:.2f}"] + inputs + [
+            "-filter_complex", fc, "-map", "[v]", "-map", "[a]",
             "-c:a", "aac", "-b:a", "160k", "-ar", "48000", "-movflags", "+faststart", "-pix_fmt"]
     encoders = []
     if _qsv_ok is not False:

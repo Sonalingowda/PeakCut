@@ -2,7 +2,9 @@
 import difflib
 import json
 import math
+import random
 import re
+import unicodedata
 import time
 
 import numpy as np
@@ -155,7 +157,67 @@ def _meaningful_terms(text):
     return {t for t in re.findall(r"[a-z0-9']+", _text(text, 200).lower()) if len(t) >= 3}
 
 
-def validate_candidate(c, start, end, lines, words, min_len, max_len):
+def script_language(text):
+    """Coarse language family from script; intentionally returns unknown for ambiguous text."""
+    chars = [c for c in str(text or "") if c.isalpha()]
+    if not chars:
+        return "unknown"
+    counts = {"ar": 0, "cyrl": 0, "latin": 0, "deva": 0}
+    for c in chars:
+        n = ord(c)
+        if 0x0600 <= n <= 0x06ff: counts["ar"] += 1
+        elif 0x0400 <= n <= 0x052f: counts["cyrl"] += 1
+        elif 0x0900 <= n <= 0x097f: counts["deva"] += 1
+        elif "LATIN" in unicodedata.name(c, ""): counts["latin"] += 1
+    family, count = max(counts.items(), key=lambda x: x[1])
+    return family if count / len(chars) >= 0.55 else "unknown"
+
+
+_LANGUAGE_WORDS = {
+    "en": {"the", "and", "are", "was", "were", "this", "that", "with", "from", "they", "have", "to", "in", "of"},
+    "es": {"el", "la", "los", "las", "y", "es", "son", "era", "este", "esta", "con", "de", "que", "en", "para", "una", "un", "está", "están", "viene", "vienen", "por"},
+    "fr": {"le", "la", "les", "et", "est", "sont", "avec", "des", "dans", "que", "une", "un", "pour"},
+    "de": {"der", "die", "das", "und", "ist", "sind", "mit", "den", "von", "zu", "ein", "eine", "nicht"},
+    "pt": {"o", "a", "os", "as", "e", "é", "são", "com", "de", "que", "em", "uma", "um", "para"},
+}
+
+
+def detect_language(text):
+    """Identify a transcript language conservatively enough to reject caption substitutions."""
+    family = script_language(text)
+    if family in {"ar", "cyrl", "deva"}:
+        return {"ar": "ar", "cyrl": "ru", "deva": "hi"}[family]
+    if family != "latin":
+        return "unknown"
+    tokens = set(re.findall(r"[a-zA-ZÀ-ÿ]+", str(text or "").lower()))
+    scores = {lang: len(tokens & words) for lang, words in _LANGUAGE_WORDS.items()}
+    best, score = max(scores.items(), key=lambda item: item[1])
+    second = sorted(scores.values())[-2] if len(scores) > 1 else 0
+    # A single shared short word is not language evidence. Ties are unknown.
+    if score < 2 or score == second:
+        return "unknown"
+    return best
+
+
+def cross_language_ground(candidate, excerpt, transcript_language):
+    """Ask for evidence entailment across languages; fail closed on errors or malformed answers."""
+    schema = {"type":"OBJECT", "properties":{"supported":{"type":"BOOLEAN"},"evidence":{"type":"STRING"}},
+              "required":["supported","evidence"]}
+    prompt = ("Judge only whether this hook and title are supported by the transcript excerpt. The transcript is "
+              f"in {transcript_language}; hook/title are English. Translate mentally if needed. Do not infer visuals. "
+              "Return supported=true only when the excerpt explicitly entails the central claim; otherwise false.\n"
+              f"HOOK: {_safe(candidate.get('hook'),100)}\nTITLE: {_safe(candidate.get('title'),160)}\n"
+              f"TRANSCRIPT: {_safe(excerpt,3000)}")
+    try:
+        answer, _model, _tokens = ask_ai(prompt, schema=schema, purpose="Cross-language clip grounding")
+        proof = _text(answer.get("evidence"), 300) if isinstance(answer, dict) else ""
+        return bool(isinstance(answer, dict) and answer.get("supported") is True and proof.strip()), proof
+    except Exception as e:
+        return False, f"Grounding unavailable: {str(e)[:160]}"
+
+
+def validate_candidate(c, start, end, lines, words, min_len, max_len, transcript_language=None,
+                       allow_cross_language=False, grounding=None):
     """Conservative transcript evidence gate. It does not claim to verify visuals."""
     hook = _text(c.get("hook"), 60).strip().upper()
     title = _text(c.get("title"), 100).strip()
@@ -175,14 +237,25 @@ def validate_candidate(c, start, end, lines, words, min_len, max_len):
     evidence = _meaningful_terms(context)
     hook_terms, title_terms = _meaningful_terms(hook), _meaningful_terms(title)
     hook_matches = hook_terms & evidence
-    if len(hook_terms) < 2 or len(hook_matches) < 2 or len(hook_matches) / len(hook_terms) < 0.67:
-        return False, "hook is not meaningfully supported by the selected transcript"
     title_matches = title_terms & evidence
-    if len(title_terms) < 2 or len(title_matches) < 2 or len(title_matches) / len(title_terms) < 0.4:
-        return False, "title is not supported by the selected transcript"
     reason_terms = _meaningful_terms(reason)
-    if len(reason_terms) < 2 or len(reason_terms & evidence) < 2:
-        return False, "selection reason lacks transcript evidence"
+    lexical_ok = (len(hook_terms) >= 2 and len(hook_matches) >= 2 and len(hook_matches) / len(hook_terms) >= 0.67
+                  and len(title_terms) >= 2 and len(title_matches) >= 2 and len(title_matches) / len(title_terms) >= 0.4
+                  and len(reason_terms) >= 2 and len(reason_terms & evidence) >= 2)
+    if not lexical_ok:
+        if script_language(context) == "latin":
+            if len(hook_terms) < 2 or len(hook_matches) < 2 or len(hook_matches) / max(1, len(hook_terms)) < 0.67:
+                return False, "hook is not meaningfully supported by the selected transcript"
+            if len(title_terms) < 2 or len(title_matches) < 2 or len(title_matches) / max(1, len(title_terms)) < 0.4:
+                return False, "title is not supported by the selected transcript"
+            return False, "selection reason lacks transcript evidence"
+        if not allow_cross_language or not transcript_language or transcript_language == "unknown":
+            return False, "language/evidence mismatch; semantic support could not be established"
+        supported, proof = cross_language_ground(c, context, transcript_language)
+        if grounding is not None:
+            grounding.update(evidence=proof, decision="accepted" if supported else "rejected")
+        if not supported:
+            return False, "cross-language semantic grounding rejected or unavailable: " + proof
     # Require a sufficiently dense, time-spread spoken sequence. Punctuation is
     # not treated as proof of a payoff. The language model proposes the moment's
     # semantic arc; this gate can only check transcript support and boundaries.
@@ -313,6 +386,56 @@ def fallback_by_loudness(db, words, n, max_len, duration):
     return picks
 
 
+def fallback_transcript_moments(words, db, n, min_len, max_len, duration, seed=""):
+    """Choose varied, transcript-grounded moments when a short video's AI finds no clear highlight.
+
+    This is deliberately not used when the AI is unavailable. It can only describe words that were actually
+    spoken, and the normal candidate validation still decides whether each moment is safe to keep.
+    """
+    if duration > 15 * 60 or len(words) < 12:
+        return []
+    lines = make_lines(words, loud_zscore(db))
+    possible = []
+    for line in lines:
+        if line["s"] > duration - min_len or line["e"] - line["s"] < 0.5:
+            continue
+        nearby = [w for w in words if line["s"] <= w["s"] <= min(duration, line["s"] + max_len * 0.55)]
+        if len(nearby) < 3:
+            continue
+        # Use a short phrase that is literally present in the selected speech, preferring one with enough
+        # meaningful words to survive the ordinary evidence gate.
+        phrase = ""
+        for i in range(max(1, len(nearby) - 4)):
+            trial = " ".join(str(w.get("w") or "").strip() for w in nearby[i:i + 5]).strip()
+            if len(_meaningful_terms(trial)) >= 2:
+                phrase = trial
+                break
+        if not phrase or _GENERIC_HOOK_RE.search(phrase):
+            continue
+        loud = float(np.max(db[int(line["s"]):int(line["e"]) + 1])) if len(db) else 0.0
+        # Leave enough lead-in for the normal context gate; the phrase itself may be later in the window.
+        window_start = max(0.0, line["s"] - max_len * 0.7)
+        possible.append((loud + min(1.0, len(nearby) / 20), window_start, phrase))
+    if not possible:
+        return []
+    chooser = random.Random(str(seed) + ":" + str(round(duration, 2)))
+    chooser.shuffle(possible)
+    possible.sort(key=lambda item: item[0], reverse=True)
+    picks = []
+    for _score, start, phrase in possible:
+        end = min(duration, start + max_len)
+        if _overlaps(start, end, picks):
+            continue
+        picks.append({"start": start, "end": end, "score": 45, "category": "other",
+                      "hook": phrase.upper(), "title": phrase[:1].upper() + phrase[1:],
+                      "description": "A randomly selected spoken moment from the video.",
+                      "hashtags": [], "highlight_words": [],
+                      "reason": "The transcript includes this spoken moment: " + phrase})
+        if len(picks) >= n:
+            break
+    return picks
+
+
 def _game_rules(game):
     """The extra rules for a known game, or nothing."""
     if not game:
@@ -322,12 +445,12 @@ def _game_rules(game):
     return GAME_RULES.format(game=_safe(games.name_of(game) or str(game), 40), tags=tags)
 
 
-def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=15, max_len=60, log=print, game=None):
+def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=15, max_len=60, log=print, game=None, language=None):
     z = loud_zscore(db)
     lines = make_lines(words, z)
     if not lines:
         return [], {"model": None, "note": "No speech found."}
-    found, used_model, tokens = [], None, 0
+    found, used_model, tokens, diagnostics = [], None, 0, []
     t = 0.0
     windows = []
     while t < duration:
@@ -363,9 +486,20 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
     clips = []
     for c in sorted(found, key=lambda c: -_num(c.get("score"))):
         s, e = _snap(c, lines, words, min_len, max_len, duration)
+        excerpt = " ".join(l["text"] for l in lines if l["s"] >= s - 0.6 and l["e"] <= e + 0.6)
+        grounding = {"evidence": "", "decision": "not_needed"}
+        diag = {"raw": {k: c.get(k) for k in ("hook", "title", "start", "end", "reason", "score")},
+                "start": s, "end": e, "language": language or script_language(" ".join(w.get("w", "") for w in words)),
+                "transcript_excerpt": excerpt[:3000], "grounding": grounding}
         if e - s < min(min_len, duration) - 1:
+            diag.update(accepted=False, rejection_reason="clip duration outside its allowed bounds")
+            diagnostics.append(diag)
             continue
-        valid, why = validate_candidate(c, s, e, lines, words, min_len, max_len)
+        valid, why = validate_candidate(c, s, e, lines, words, min_len, max_len,
+                                        transcript_language=diag["language"], allow_cross_language=True,
+                                        grounding=grounding)
+        diag.update(accepted=valid, rejection_reason=None if valid else why)
+        diagnostics.append(diag)
         if not valid:
             log(f"Candidate near {s:.0f}s rejected: {why}.")
             continue
@@ -374,8 +508,27 @@ def find_clips(words, db, duration, title="", uploader="", max_clips=6, min_len=
         clips.append(_tidy(c, s, e, game))
         if len(clips) >= max_clips:
             break
+    if not clips and duration <= 15 * 60 and used_model:
+        # A 9–15 minute video can be perfectly usable even when it has no obvious AI-selected payoff.
+        # Try a few varied transcript-backed moments, then run them through the same safety gate above.
+        for c in fallback_transcript_moments(words, db, max_clips, min_len, max_len, duration, title):
+            s, e = _snap(c, lines, words, min_len, max_len, duration)
+            excerpt = " ".join(l["text"] for l in lines if l["s"] >= s - 0.6 and l["e"] <= e + 0.6)
+            grounding = {"evidence": "", "decision": "not_needed"}
+            diag = {"raw": {k: c.get(k) for k in ("hook", "title", "start", "end", "reason", "score")},
+                    "start": s, "end": e, "language": language or script_language(" ".join(w.get("w", "") for w in words)),
+                    "transcript_excerpt": excerpt[:3000], "grounding": grounding, "fallback": "random_transcript_moment"}
+            valid, why = validate_candidate(c, s, e, lines, words, min_len, max_len,
+                                            transcript_language=diag["language"], allow_cross_language=True,
+                                            grounding=grounding)
+            diag.update(accepted=valid, rejection_reason=None if valid else why)
+            diagnostics.append(diag)
+            if valid and not _overlaps(s, e, clips):
+                clips.append(_tidy(c, s, e, game))
+            if len(clips) >= max_clips:
+                break
     clips.sort(key=lambda c: c["start"])
-    return clips, {"model": used_model, "tokens": tokens, "note": note}
+    return clips, {"model": used_model, "tokens": tokens, "note": note, "candidate_diagnostics": diagnostics}
 
 
 def find_live_clips(words, z, now, chat=None, title="", uploader="", min_len=15, max_len=60, existing=(), game=None):

@@ -54,7 +54,7 @@ def _mirror(p):
     job = jobs.get(p["job"])
     clip = next((c for c in job["clips"] if c["id"] == p["clip"]), None) if job else None
     if clip is not None:
-        clip.setdefault("posts", {})[p["id"]] = {k: p.get(k) for k in ("account_name", "platform", "status", "remote_state", "url", "due_at", "scheduled_publish_at", "published_at", "error")}
+        clip.setdefault("posts", {})[p["id"]] = {"id": p["id"], **{k: p.get(k) for k in ("account", "account_name", "platform", "status", "remote_state", "url", "due_at", "scheduled_publish_at", "published_at", "error")}}
         jobs.save(job)
 
 

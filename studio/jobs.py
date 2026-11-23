@@ -11,7 +11,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from . import brain, config, creators, ctx, facecam, games, learning, load, media, quality, render, roman, safe, transcribe, usage
+from . import brain, config, creators, ctx, facecam, games, learning, load, media, quality, render, roman, safe, transcribe, usage, voiceover
 
 class _FairQueue:
     """Whose video is next. Each person has their own line and the lines take turns, so someone who adds ten
@@ -108,7 +108,7 @@ _lock = threading.RLock()
 on_clip_ready: list = []   # callbacks (job, clip), run once when a clip first finishes
 
 DEFAULTS = {"max_clips": 6, "min_len": 15, "max_len": 60, "style": "bounce", "layout": "blur", "quality": 720,
-            "range_start": None, "range_end": None, "captions": True}
+            "range_start": None, "range_end": None, "captions": True, "voiceover": False}
 
 
 LIMITS = {"max_clips": (1, 20), "min_len": (5, 120), "max_len": (10, 180), "quality": (360, 1080)}
@@ -118,9 +118,9 @@ def clean_options(options) -> dict:
     """Only known settings, each inside its allowed range. Raises ValueError on nonsense."""
     out = {}
     for k, v in (options if isinstance(options, dict) else {}).items():
-        if k == "captions":
+        if k in ("captions", "voiceover"):
             if not isinstance(v, bool):
-                raise ValueError("Captions must be on or off.")
+                raise ValueError(f"{k.capitalize()} must be on or off.")
             out[k] = v
             continue
         if k not in DEFAULTS or v in ("", None):
@@ -207,6 +207,7 @@ def _load_file(f: Path, uid: str):
     job.setdefault("kind", "video")
     job.setdefault("creator", None)
     job.setdefault("options", {}).setdefault("captions", True)
+    job["options"].setdefault("voiceover", False)
     if job.get("source_path"):
         job["source_path"] = _remap(job["source_path"], f.parent)
     if job.get("source", {}).get("path"):
@@ -219,6 +220,7 @@ def _load_file(f: Path, uid: str):
     buffered = job.get("kind") == "live" and any((f.parent / "buffer").glob("*.ts"))
     for c in job.get("clips", []):
         c.setdefault("captions", job["options"]["captions"])
+        c.setdefault("voiceover", job["options"]["voiceover"])
         if c.get("src"):
             c["src"] = _remap(c["src"], f.parent / "clips")
         if c.get("status") in ("rendering", "queued"):
@@ -288,7 +290,7 @@ def create(source: dict, options: dict, enqueue=True, creator=None, kind="video"
     c = creators.get(creator) if creator else None
     if c:
         d = creators.root(c["id"]) / ("live" if kind == "live" else "videos") / jid
-        base = {**DEFAULTS, **{k: c[k] for k in ("max_clips", "min_len", "max_len", "style", "layout", "captions")}}
+        base = {**DEFAULTS, **{k: c[k] for k in ("max_clips", "min_len", "max_len", "style", "layout", "captions", "voiceover")}}
     else:
         d, base, creator = config.user_dir(ctx.uid()) / "jobs" / jid, dict(DEFAULTS), None
     opts = {**base, **clean_options(options)}
@@ -310,6 +312,44 @@ def create(source: dict, options: dict, enqueue=True, creator=None, kind="video"
 def enqueue(job):
     save(job)
     _q.put(("job", job["id"], None), user=job["user"])
+
+
+def retry_analysis(jid: str) -> dict:
+    """Retry a completed AI-failed job from its verified, job-local source file."""
+    with _lock:
+        job = get(jid)
+        if not job:
+            raise ValueError("No such job.")
+        if job.get("status") in ("queued", "running", "live"):
+            raise ValueError("This video is already being processed.")
+        if job.get("kind") == "live" or job.get("clips"):
+            raise ValueError("Retry Analysis is only available when analysis failed before any clips were generated.")
+        ai = job.get("ai") or {}
+        failed = bool(ai.get("note") or any("AI window" in str(x) and "failed" in str(x) for x in ai.get("log", [])))
+        if not failed:
+            raise ValueError("This job does not have a saved AI analysis failure to retry.")
+        root = Path(job["dir"]).resolve(strict=True)
+        candidate = root / "source.mp4"
+        if candidate.is_symlink() or not candidate.is_file():
+            raise ValueError("The original local source file is missing or unsafe; retry cannot proceed without downloading.")
+        resolved = candidate.resolve(strict=True)
+        try:
+            resolved.relative_to(root)
+            with resolved.open("rb") as f:
+                if not f.read(1):
+                    raise ValueError("The local source file is empty.")
+        except (OSError, ValueError) as e:
+            raise ValueError("The original local source is not readable and contained in this job.") from e
+        if job.get("user") != ctx.uid():
+            raise ValueError("No such job.")
+        # Keep the original URL and failure history; only this retry uses the
+        # existing local media path. The processing path recognizes this flag.
+        job.update(retry_source_path=str(resolved), retry_analysis=True, status="queued",
+                   stage="Waiting to retry analysis from the saved source", progress=0.0,
+                   error=None, clips=[], retry_started_at=time.time())
+        save(job)
+        _q.put(("job", jid, None), user=job["user"])
+        return job
 
 
 def submit(fn):
@@ -348,6 +388,8 @@ def request_render(jid, cid, changes: dict):
     new = dict(clip)
     if "captions" in changes:
         new.update(clean_options({"captions": changes["captions"]}))
+    if "voiceover" in changes:
+        new.update(clean_options({"voiceover": changes["voiceover"]}))
     for k in ("start", "end"):
         if k in changes:
             new[k] = round(float(changes[k]), 2)
@@ -365,6 +407,8 @@ def request_render(jid, cid, changes: dict):
         new["style"] = DEFAULTS["style"]
     if new.get("layout") not in render.LAYOUTS:
         new["layout"] = DEFAULTS["layout"]
+    if (new["start"], new["end"]) != (clip["start"], clip["end"]):
+        clip.pop("voice_line", None)          # the take was written for the old moment: write a new one
     clip.update(new, status="queued")
     save(job)
     _q.put(("clip", jid, cid))
@@ -383,6 +427,14 @@ def render_one(job, clip, words):
             clip["end"] = min(clip["end"], job["duration"])
         local = dict(clip, start=clip["start"] - off, end=clip["end"] - off, hook=roman.to_roman(clip.get("hook") or ""))
         near = _caption_words(job, clip, words, off) if clip.get("captions", True) else []
+        if clip.get("voiceover"):
+            # A short spoken take over the start. If anything about it fails the clip is simply made without it.
+            voice = voiceover.make(clip, words, d / "clips", job.get("title") or "", job.get("uploader") or "")
+            if voice:
+                local["voice_file"] = str(voice["file"])
+                clip["voice_line"] = voice["line"]
+            else:
+                clip.pop("voice_line", None)
         out = render.render_clip(src, d / "clips", clip["id"], local, near, job["width"], job["height"])
         rendered = d / "clips" / out["file"]
         # Unit tests may replace the encoder with a stub. Real files always go
@@ -531,6 +583,26 @@ def _covers(words: list, start: float, end: float) -> bool:
     return len(inside) >= 25 * minutes and inside[-1]["s"] >= start + 0.85 * (end - start)
 
 
+def _verify_youtube_transcript(yt, audio, lo, hi):
+    """Use YouTube words only after Parakeet independently identifies the same language."""
+    yt_language = str(yt[1] or "unknown").split("-")[0].lower()
+    caption_text = " ".join(w.get("w", "") for w in yt[0])
+    caption_language = brain.detect_language(caption_text)
+    if caption_language == "unknown":
+        caption_language = yt_language if yt_language in {"ar", "en", "es", "fr", "de", "pt", "ru", "hi"} else "unknown"
+    try:
+        independent_words = transcribe.transcribe(audio[lo:hi])
+    except Exception as e:  # noqa: BLE001 - a failed check must never approve borrowed captions
+        return False, [], yt_language, "unknown", "Independent audio language check failed: " + str(e)[:180]
+    independent_text = " ".join(w.get("w", "") for w in (independent_words or []))
+    audio_language = brain.detect_language(independent_text)
+    if not independent_words or audio_language == "unknown":
+        return False, [], yt_language, audio_language, "YouTube captions were not used because independent audio language verification failed."
+    if audio_language != caption_language:
+        return False, independent_words, yt_language, audio_language, "YouTube captions were not used because their language does not match the audio."
+    return True, independent_words, yt_language, audio_language, ""
+
+
 def _facecam(job) -> list | None:
     """Where the webcam is in the source: once for the whole video, for every clip of it.
 
@@ -557,6 +629,9 @@ def _run_job(job):
     d = Path(job["dir"])
     o = job["options"]
     src = job["source"]
+    retry_source = bool(job.pop("retry_analysis", False))
+    if retry_source:
+        src = {"type": "file", "path": job.get("retry_source_path"), "name": src.get("name", job.get("title", "saved source"))}
     # Which game this is: what the creator set, or what the title says. It decides the extra rules the AI
     # reads and the tags every post carries.
     game = job.get("game") or ""
@@ -682,8 +757,27 @@ def _run_job(job):
             yt = None
         if yt and not _covers(yt[0], lo / 16000, hi / 16000):
             yt = None
-        job["transcript_from"] = "youtube" if yt else "own"
-        job["lang"] = yt[1] if yt else ""          # the language spoken, when YouTube says (decides the captions)
+    if yt:
+        verified, independent_words, yt_language, audio_language, verification_note = _verify_youtube_transcript(yt, audio, lo, hi)
+        if verification_note:
+            notes.append(verification_note)
+        if not verified:
+            yt = None
+            if independent_words:
+                words = [dict(w, s=round(w["s"] + lo / 16000, 2), e=round(w["e"] + lo / 16000, 2)) for w in independent_words]
+                job["transcript_from"] = "own_language_mismatch"
+                job["caption_language"] = yt_language
+                job["audio_language"] = audio_language
+                job["lang"] = audio_language
+        else:
+            job["transcript_from"] = "youtube"
+            job["caption_language"] = yt_language
+            job["audio_language"] = audio_language
+            job["lang"] = audio_language
+    if not yt and not job.get("transcript_from"):
+        job["transcript_from"] = "own"
+        job["audio_language"] = "unknown"
+        job["lang"] = "unknown"
     if resuming:
         try:
             words = json.loads((d / "words.json").read_text(encoding="utf-8"))
@@ -744,7 +838,9 @@ def _run_job(job):
         quota = max(1, math.ceil(left / (len(blocks) - bi)))
         s0 = int((a - lo) / 16000)
         found, ai = brain.find_clips(bw, db[s0: s0 + int((b - a) / 16000) + 1], (b - a) / 16000, job["title"],
-                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append, game=game)
+                                     job["uploader"], quota, int(o["min_len"]), int(o["max_len"]), notes.append, game=game,
+                                     language=job.get("audio_language", job.get("lang")))
+        job.setdefault("candidate_diagnostics", []).extend(ai.get("candidate_diagnostics", []))
         tokens += ai.get("tokens", 0)
         model = ai.get("model") or model
         if ai.get("note"):
@@ -783,7 +879,7 @@ def _run_job(job):
         for c in found:
             c.update(id=f"clip{len(job['clips']) + 1:02d}", start=round(c["start"] + shift, 2),
                      end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"],
-                     captions=o.get("captions", True), status="queued", version=0)
+                     captions=o.get("captions", True), voiceover=o.get("voiceover", False), status="queued", version=0)
             # Only the gameplay layout uses a webcam, so it is only looked for then, and only once: a
             # stream with no webcam is not looked for again on every clip of it.
             if o["layout"] == "gameplay" and face is False:

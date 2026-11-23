@@ -246,3 +246,15 @@ def _read_google_client() -> tuple:
 # ---------------------------------------------------------------- video
 MAX_SOURCE_HEIGHT = 1080
 OUT_W, OUT_H, OUT_FPS = 1080, 1920, 30
+
+
+# ---------------------------------------------------------------- voiceover (see voiceover.py)
+# A short spoken take over the start of each clip. Off unless a speech service is chosen.
+#   edge    free, no key: pip install edge-tts (uses Microsoft's online voices)
+#   openai  OpenAI's speech API, or any service that speaks the same format (set PEAKCUT_TTS_BASE_URL)
+TTS_PROVIDER = (env("PEAKCUT_TTS_PROVIDER", "") or "").strip().lower()
+TTS_KEY = _secret("PEAKCUT_TTS_KEY", "PEAKCUT_TTS_KEY_FILE", r"\S{8,}") if (env("PEAKCUT_TTS_KEY") or env("PEAKCUT_TTS_KEY_FILE")) else ""
+TTS_BASE_URL = env("PEAKCUT_TTS_BASE_URL", "")
+TTS_MODEL = env("PEAKCUT_TTS_MODEL", "")
+TTS_VOICE = env("PEAKCUT_TTS_VOICE", "")
+TTS_RATE = env("PEAKCUT_TTS_RATE", "+8%")      # edge only: a little faster than normal suits short videos

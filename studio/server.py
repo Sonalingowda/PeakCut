@@ -22,7 +22,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from . import admin as admins
 from . import account, load
 from . import (accounts, ai, alerts, auth, config, creators, ctx, db, jobs, live, media, posting,
-               profiles, render, safe, transcribe, usage)
+               profiles, render, safe, transcribe, usage, voiceover)
 
 from . import tools as _tools  # noqa: E402
 
@@ -577,7 +577,8 @@ def status(request: Request):
     return {"user": auth.public(me_), "update": updates.latest() if me_.is_admin else None, "accounts": config.ACCOUNTS, "disk_full": load.disk_full(), "no_ffmpeg": bool(_tools.missing()), "links": {"repo": config.REPO_URL, "follow": config.FOLLOW_URL}, "ai": usage.brief(), "unread": notices.unread(),
             "tour": not accounts.settings()["tour_done"],
             "youtube": accounts.youtube_ready(), "connect": {p: accounts.can_connect(p) for p in accounts.PLATFORM_NAMES}, "max_upload_mb": config.MAX_UPLOAD_MB, "upload_part_mb": config.UPLOAD_PART_MB, "max_batch": config.MAX_ACTIVE_JOBS_PER_USER,
-            "styles": {k: v["label"] for k, v in render.STYLES.items()}, "layouts": render.LAYOUTS}
+            "styles": {k: v["label"] for k, v in render.STYLES.items()}, "layouts": render.LAYOUTS,
+            "voiceover": {"ready": voiceover.ready(), "why_not": voiceover.why_not()}}
 
 
 # ================================================================ videos
@@ -683,6 +684,16 @@ def list_jobs():
 @app.get("/api/jobs/{jid}")
 def get_job(jid: str):
     return jobs.public(_job_or_404(jid))
+
+
+@app.post("/api/jobs/{jid}/retry-analysis")
+def retry_job_analysis(jid: str):
+    job = _job_or_404(jid)
+    try:
+        retried = jobs.retry_analysis(job["id"])
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return jobs.public(retried)
 
 
 @app.get("/api/preview")
@@ -1455,10 +1466,30 @@ def add_posts(body: dict = Body(...)):
     clip = next((c for c in job["clips"] if c["id"] == body.get("clip")), None) if job else None
     if not clip or clip.get("status") != "done":
         raise HTTPException(404, "That clip is not ready")
-    made = posting.enqueue(job, clip, [str(a) for a in body.get("accounts", [])][:20], now=bool(body.get("now")))
+    raw_accounts = body.get("accounts")
+    if not isinstance(raw_accounts, list) or not raw_accounts:
+        raise HTTPException(400, "No account was selected. Choose at least one connected account.")
+    account_ids = list(dict.fromkeys(str(a) for a in raw_accounts[:20]))
+    if any(not accounts.get(aid) for aid in account_ids):
+        raise HTTPException(400, "One or more selected accounts are disconnected. Reconnect them in Settings, then try again.")
+    outcome = posting.enqueue_batch([(job, clip, account_ids)], now=bool(body.get("now")))[0]
+    made, existing = outcome["made"], outcome["existing"]
+    already = len(existing)
+    needs_retry = sum(1 for p in existing if p.get("status") == "failed")
+    needs_reconcile = sum(1 for p in existing if p.get("status") == "uncertain")
+    already_published = any(p.get("remote_id") and "already been published" in str(p.get("error") or "").lower() for p in existing)
     if not made:
-        raise HTTPException(400, "Nothing was queued. Pick at least one account this clip has not already gone to.")
-    return {"queued": len(made)}
+        if needs_reconcile:
+            message = "This clip has an uncertain existing post. Reconcile it before trying again; PeakCut will not risk a duplicate upload."
+        elif already_published:
+            message = "YouTube says this clip was already published. Reconcile the existing post before trying again; PeakCut will not create a duplicate."
+        elif needs_retry:
+            message = "This clip has an existing failed post. Use Retry or Reconcile in Publishing > Needs attention instead of queueing a duplicate."
+        else:
+            message = "This clip already has a publishing record for the selected account. Choose another account or use the existing record in Publishing."
+        raise HTTPException(400, detail={"message": message, "queued": 0, "already": already,
+                                         "needs_retry": needs_retry, "needs_reconcile": needs_reconcile})
+    return {"queued": len(made), "already": already, "needs_retry": needs_retry, "needs_reconcile": needs_reconcile}
 
 
 @app.post("/api/posts/batch")
@@ -1513,16 +1544,18 @@ def add_posts_batch(body: dict = Body(...)):
         raise HTTPException(400, detail={"message": "Nothing was queued because the selection is invalid; fix every item and try again.", "results": errors})
 
     outcomes = posting.enqueue_batch(prepared)
-    results, totals = [], {"queued": 0, "already": 0, "needs_retry": 0, "rejected": 0}
+    results, totals = [], {"queued": 0, "already": 0, "needs_retry": 0, "needs_reconcile": 0, "rejected": 0}
     for (job, clip, _accounts), outcome in zip(prepared, outcomes):
         made, existing = outcome["made"], outcome["existing"]
         already, needs_retry = len(existing), outcome["needs_retry"]
+        needs_reconcile = sum(1 for p in existing if p.get("status") == "uncertain")
         totals["queued"] += len(made)
         totals["already"] += already
         totals["needs_retry"] += needs_retry
-        status = "queued" if made else "needs_retry" if needs_retry else "already"
+        totals["needs_reconcile"] += needs_reconcile
+        status = "queued" if made else "needs_reconcile" if needs_reconcile else "needs_retry" if needs_retry else "already"
         results.append({"job": job["id"], "clip": clip["id"], "status": status, "queued": len(made),
-                        "already": already, "needs_retry": needs_retry, "rejected": 0})
+                        "already": already, "needs_retry": needs_retry, "needs_reconcile": needs_reconcile, "rejected": 0})
     return {**totals, "results": results}
 
 

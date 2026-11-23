@@ -40,22 +40,22 @@ def _unlink(root: Path, path: Path, errors: list[str]) -> None:
 
 
 def clip(job: dict, clip_record: dict) -> dict:
-    """Remove only this confirmed clip's generated artifacts."""
+    """Remove only generated media for this clip; retain review metadata and captions."""
     root, errors = _job_root(job)
     if root is None:
         return {"ok": False, "errors": errors}
-    for value in (clip_record.get("file"), clip_record.get("cover")):
-        if value:
-            _unlink(root / "clips", Path(str(value)).name, errors)
-    cid = str(clip_record.get("id") or "")
-    stem = Path(str(clip_record.get("file") or cid)).stem
-    for suffix in (".ass", ".json", ".src", ".wav"):
-        _unlink(root / "clips", Path(stem + suffix), errors)
+    value = clip_record.get("file")
+    if value:
+        name = Path(str(value)).name
+        if Path(str(value)).name != str(value) or Path(name).suffix.lower() not in (".mp4", ".mov", ".webm", ".mkv", ".m4v"):
+            errors.append("Refused cleanup of a non-clip or unsafe media path.")
+        else:
+            _unlink(root / "clips", name, errors)
     return {"ok": not errors, "errors": errors}
 
 
-def job(job: dict, remove_source: bool = True, remove_clips: bool = True) -> dict:
-    """Remove known temporary artifacts, never the job metadata or its parent."""
+def job(job: dict, remove_source: bool = True, remove_clips: bool = False) -> dict:
+    """Remove only a completed job's temporary source; clip cleanup is always per clip."""
     root, errors = _job_root(job)
     if root is None:
         return {"ok": False, "errors": errors}
@@ -63,14 +63,6 @@ def job(job: dict, remove_source: bool = True, remove_clips: bool = True) -> dic
         source = Path(job["source_path"])
         if _inside(root, source):
             _unlink(root, source, errors)
-    for name in ("audio.wav", "words.json", "words_en.json"):
+    for name in ("audio.wav",):
         _unlink(root, Path(name), errors)
-    clips_dir = root / "clips"
-    if remove_clips and clips_dir.is_dir():
-        if clips_dir.is_symlink() or not _inside(root, clips_dir):
-            errors.append("Refused cleanup through a symlinked clips directory.")
-        else:
-            for path in clips_dir.iterdir():
-                if path.is_file() and path.suffix.lower() in (".mp4", ".jpg", ".ass", ".json", ".src", ".wav"):
-                    _unlink(clips_dir, path.name, errors)
     return {"ok": not errors, "errors": errors}
